@@ -97,12 +97,20 @@ def get_dataset_paired(
     Prompts are structured as follows:
       "Question: " + <prompt> + "\n\nAnswer: "
     """
-    dataset = load_dataset(
-        dataset_name,
-        split="train",
-        cache_dir=cache_dir,
-        data_dir=data_dir,
-    )
+    try:
+        dataset = load_dataset(
+            dataset_name,
+            split="train",
+            cache_dir=cache_dir,
+            data_dir=data_dir,
+        )
+    except:
+        dataset = load_dataset(
+            dataset_name,
+            split="train",
+            cache_dir=cache_dir,
+        )
+
     original_columns = dataset.column_names
 
     if sanity_check:
