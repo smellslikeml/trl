@@ -22,6 +22,7 @@ from typing import Dict, Optional
 
 import torch
 from datasets import Dataset, load_dataset
+from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
 
 from trl import DPOTrainer
@@ -39,11 +40,15 @@ class ScriptArguments:
 
     # training parameters
     model_name_or_path: Optional[str] = field(default="gpt2", metadata={"help": "the model name"})
+    dataset_name: Optional[str] = field(
+        default="Anthropic/hh-rlhf", metadata={"help": "the dataset name"}
+    )
     learning_rate: Optional[float] = field(default=1e-3, metadata={"help": "optimizer learning rate"})
     per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
         default=1, metadata={"help": "the number of gradient accumulation steps"}
     )
+    use_peft: Optional[bool] = field(default=False, metadata={"help": "Whether to use PEFT or not to train adapters"})
     max_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample"})
     max_prompt_length: Optional[int] = field(default=128, metadata={"help": "max length of each sample's prompt"})
     max_target_length: Optional[int] = field(
@@ -79,8 +84,8 @@ def extract_anthropic_prompt(prompt_and_response):
     return prompt_and_response[: search_term_idx + len(search_term)]
 
 
-def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: str = None) -> Dataset:
-    """Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
+def get_hh(dataset_name: str, split: str, sanity_check: bool = False, silent: bool = False, cache_dir: str = None) -> Dataset:
+    """Load dataset from Hugging Face and convert it to the necessary format if needed.
 
     The dataset is converted to a dictionary with the following structure:
     {
@@ -93,9 +98,11 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
       \n\nHuman: <prompt>\n\nAssistant:
     Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
     """
-    dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
+    dataset = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
+    if set(['prompt', 'chosen', 'rejected']).issubset(dataset.column_names):
+        return dataset
 
     def split_prompt_and_responses(sample) -> Dict[str, str]:
         prompt = extract_anthropic_prompt(sample["chosen"])
@@ -106,6 +113,7 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
         }
 
     return dataset.map(split_prompt_and_responses)
+
 
 
 if __name__ == "__main__":
@@ -128,10 +136,10 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     # 2. Load the Anthropic Helpful-Harmless dataset
-    train_dataset = get_hh("train", sanity_check=script_args.sanity_check)
+    train_dataset = get_hh(script_args.dataset_name, "train", sanity_check=script_args.sanity_check)
 
     # 3. Load evaluation dataset
-    eval_dataset = get_hh("test", sanity_check=script_args.sanity_check)
+    eval_dataset = get_hh(script_args.dataset_name, "test", sanity_check=script_args.sanity_check)
 
     # 4. initialize training arguments:
     training_args = TrainingArguments(
@@ -151,6 +159,17 @@ if __name__ == "__main__":
         bf16=True,
     )
 
+    # Step 4: Define the LoraConfig
+    if script_args.use_peft:
+        peft_config = LoraConfig(
+            r=script_args.peft_lora_r,
+            lora_alpha=script_args.peft_lora_alpha,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+    else:
+        peft_config = None
+
     # 5. initialize the DPO trainer
     dpo_trainer = DPOTrainer(
         model,
@@ -164,6 +183,7 @@ if __name__ == "__main__":
         max_target_length=script_args.max_target_length,
         max_prompt_length=script_args.max_prompt_length,
         generate_during_eval=True,
+        peft_config=peft_config,
     )
 
     # 6. train
