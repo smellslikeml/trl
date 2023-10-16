@@ -26,6 +26,9 @@ class ScriptArguments:
         default="../sft/results/final_checkpoint",
         metadata={"help": "the location of the SFT model name or path"},
     )
+    dataset_name: Optional[str] = field(
+        default="lvwerra/stack-exchange-paired", metadata={"help": "the dataset name"}
+    )
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
     warmup_steps: Optional[int] = field(default=100, metadata={"help": "the number of warmup steps"})
@@ -75,13 +78,14 @@ class ScriptArguments:
     )
 
 
-def get_stack_exchange_paired(
+def get_dataset_paired(
+    dataset_name: str = "lvwerra/stack-exchange-paired",
     data_dir: str = "data/rl",
     sanity_check: bool = False,
     cache_dir: str = None,
     num_proc=24,
 ) -> Dataset:
-    """Load the stack-exchange-paired dataset from Hugging Face and convert it to the necessary format.
+    """Load a dataset from Hugging Face and format it if necessary.
 
     The dataset is converted to a dictionary with the following structure:
     {
@@ -94,7 +98,7 @@ def get_stack_exchange_paired(
       "Question: " + <prompt> + "\n\nAnswer: "
     """
     dataset = load_dataset(
-        "lvwerra/stack-exchange-paired",
+        dataset_name,
         split="train",
         cache_dir=cache_dir,
         data_dir=data_dir,
@@ -103,6 +107,9 @@ def get_stack_exchange_paired(
 
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
+
+    if set(["prompt", "chosen", "rejected"]).issubset(dataset.column_names):
+        return dataset
 
     def return_prompt_and_responses(samples) -> Dict[str, str]:
         return {
@@ -144,18 +151,18 @@ if __name__ == "__main__":
         torch_dtype=torch.float16,
         load_in_4bit=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load the Stack-exchange paired dataset
-    train_dataset = get_stack_exchange_paired(data_dir="data/rl", sanity_check=script_args.sanity_check)
+    # 2. Load the paired dataset
+    train_dataset = get_dataset_paired(dataset_name=script_args.dataset_name, data_dir="data/rl", sanity_check=script_args.sanity_check)
     train_dataset = train_dataset.filter(
         lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
         and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
     )
 
     # 3. Load evaluation dataset
-    eval_dataset = get_stack_exchange_paired(data_dir="data/evaluation", sanity_check=True)
+    eval_dataset = get_dataset_paired(dataset_name=script_args.dataset_name, data_dir="data/evaluation", sanity_check=True)
     eval_dataset = eval_dataset.filter(
         lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
         and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
