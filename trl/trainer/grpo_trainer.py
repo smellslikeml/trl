@@ -71,6 +71,7 @@ from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generatio
 from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
+from .entropy_driven_advantage import compute_entropy_driven_advantage
 from .grpo_config import GRPOConfig
 from .utils import (
     RepeatSampler,
@@ -639,6 +640,7 @@ class GRPOTrainer(_BaseTrainer):
         self.aux_loss_enabled = is_moe and args.router_aux_loss_coef != 0.0
         self.router_aux_loss_coef = args.router_aux_loss_coef
         self.scale_rewards = args.scale_rewards
+        self.entropy_driven_advantage = args.entropy_driven_advantage
         self.importance_sampling_level = args.importance_sampling_level
         self.off_policy_mask_threshold = args.off_policy_mask_threshold
         if self.use_liger_kernel and self.off_policy_mask_threshold is not None:
@@ -2160,20 +2162,28 @@ class GRPOTrainer(_BaseTrainer):
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+            need_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+            )
+            # Entropy-Driven Advantage (EDGE-GRPO) needs the generation-time policy entropy; reuse the same
+            # forward pass as old_per_token_logps when it is already being computed.
+            if need_old_logps or self.entropy_driven_advantage:
+                old_per_token_logps, generation_per_token_entropy, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
                     batch_size,
+                    compute_entropy=self.entropy_driven_advantage,
                     num_images=num_images,
                     **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, image_position_ids
                 )
+                if not need_old_logps:
+                    # Only the policy entropy was needed (for EDA); don't enable importance sampling.
+                    old_per_token_logps = None
             else:
                 old_per_token_logps = None
+                generation_per_token_entropy = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
             if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -2326,6 +2336,15 @@ class GRPOTrainer(_BaseTrainer):
         # Unscorable completions (every reward func returned None) carry no learning signal: their reward is NaN here,
         # so zero their advantage to keep them from moving the policy.
         advantages = torch.nan_to_num(advantages, nan=0.0)
+
+        # Entropy-Driven Advantage (EDGE-GRPO): reweight the advantage by group-normalized policy entropy so that
+        # confident-correct responses are amplified and confident-wrong ones penalized harder, mitigating advantage
+        # collapse. The advantage and the generation-time entropy share the same contiguous-group layout, so the
+        # group structure is reconstructed with num_generations (mirroring the reward normalization above).
+        if self.entropy_driven_advantage:
+            advantages = compute_entropy_driven_advantage(
+                advantages, generation_per_token_entropy, completion_mask, num_generations
+            )
 
         # Slice to keep only the local part of the data
         process_slice = slice(

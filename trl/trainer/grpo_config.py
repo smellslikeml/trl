@@ -757,6 +757,17 @@ class GRPOConfig(_BaseConfig):
             "scaling by the standard deviation introduces a question-level difficulty bias."
         },
     )
+    entropy_driven_advantage: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to reweight each response's advantage by its group-normalized policy entropy, as "
+            "proposed in EDGE-GRPO (https://huggingface.co/papers/2507.21848). The advantage is divided by the "
+            "per-group mean-normalized policy entropy, so confident-correct responses receive a larger advantage "
+            "and confident-wrong ones a harsher penalty. This increases advantage diversity and mitigates the "
+            "advantage-collapse problem under sparse, group-identical rewards. Computing the policy entropy "
+            "requires an extra no-grad forward pass over the generated completions during scoring."
+        },
+    )
     loss_type: str = field(
         default="dapo",
         metadata={
