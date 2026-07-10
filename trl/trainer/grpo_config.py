@@ -295,6 +295,16 @@ class GRPOConfig(_BaseConfig):
             position, improving results. Range: `[0.0-1.0]`. A value of `0.0` masks all but the highest entropy token;
             `1.0` keeps all tokens. The paper recommends a value of `0.2`. If used with
             `mask_truncated_completions=True`, only tokens from non-truncated completions are considered.
+        rsi_selection_low (`float`, *optional*):
+            Lower bound of the Relative Surprisal Index (RSI) interval used by RSI Selection (RSI-S) from
+            [Which Tokens Matter?](https://huggingface.co/papers/2606.31575). RSI couples the sampled token's
+            surprisal with the predictive entropy (`RSI = -log p / H`). Tokens whose RSI falls below this value are
+            masked out of the policy loss as redundant low-surprisal tokens. `None` (default) leaves the lower end
+            unbounded, disabling RSI-S unless `rsi_selection_high` is set. Typical values are `< 1.0`.
+        rsi_selection_high (`float`, *optional*):
+            Upper bound of the RSI interval used by RSI-S. Tokens whose RSI exceeds this value are masked out of the
+            policy loss as unstable high-surprisal tail tokens. `None` (default) leaves the upper end unbounded. RSI-S
+            is active when either `rsi_selection_low` or `rsi_selection_high` is set. Typical values are `> 1.0`.
         max_tool_calling_iterations (`int`, *optional*):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
             stops when the model generates a response turn with no tool calls or when the total response length reaches
@@ -830,6 +840,24 @@ class GRPOConfig(_BaseConfig):
             "[0.0-1.0]. A value of `0.0` masks all but the highest entropy token; `1.0` keeps all tokens. The paper "
             "recommends a value of `0.2`. If used with `mask_truncated_completions=True`, only tokens from "
             "non-truncated completions are considered."
+        },
+    )
+    rsi_selection_low: float | None = field(
+        default=None,
+        metadata={
+            "help": "Lower bound of the Relative Surprisal Index (RSI) interval used by RSI Selection (RSI-S) from "
+            "the paper 'Which Tokens Matter?' (https://huggingface.co/papers/2606.31575). RSI couples the sampled "
+            "token's surprisal with the predictive entropy (RSI = -log p / H). Tokens whose RSI falls below this "
+            "value are masked out of the policy loss as redundant low-surprisal tokens. `None` leaves the lower end "
+            "unbounded, disabling RSI-S unless `rsi_selection_high` is set. Typical values are < 1.0."
+        },
+    )
+    rsi_selection_high: float | None = field(
+        default=None,
+        metadata={
+            "help": "Upper bound of the RSI interval used by RSI-S. Tokens whose RSI exceeds this value are masked "
+            "out of the policy loss as unstable high-surprisal tail tokens. `None` leaves the upper end unbounded. "
+            "RSI-S is active when either `rsi_selection_low` or `rsi_selection_high` is set. Typical values are > 1.0."
         },
     )
     max_tool_calling_iterations: int | None = field(

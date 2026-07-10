@@ -39,6 +39,7 @@ from transformers.utils import is_peft_available
 
 from trl import GRPOConfig, GRPOTrainer
 from trl.import_utils import is_liger_kernel_available
+from trl.trainer.rsi_selection import relative_surprisal_index
 from trl.trainer.utils import get_kbit_device_map
 
 from .testing_utils import (
@@ -157,6 +158,83 @@ class TestGetHighEntropyMask(TrlTestCase):
         entropy_mask = self.get_high_entropy_mask(entropies, mask, threshold=0.5)
         expected_mask = torch.tensor([[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.bool)
         torch.testing.assert_close(entropy_mask, expected_mask)
+
+
+class TestRSISelection(TrlTestCase):
+    def _rsi_selection_mask(self, per_token_logps, entropies, mask, low=None, high=None):
+        """Helper exercising the GRPOTrainer.get_rsi_selection_mask wiring (the integration surface)."""
+        from unittest.mock import Mock
+
+        trainer = Mock(spec=GRPOTrainer)
+        return GRPOTrainer.get_rsi_selection_mask(trainer, per_token_logps, entropies, mask, low, high)
+
+    def test_relative_surprisal_index_values(self):
+        # RSI = surprisal / entropy = -log p / H. With H = 1.0, RSI equals the surprisal.
+        per_token_logps = torch.tensor([[-0.5, -2.0, -1.0, -0.1]])
+        entropies = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        mask = torch.tensor([[1, 1, 1, 1]])
+        rsi = relative_surprisal_index(per_token_logps, entropies, mask)
+        torch.testing.assert_close(rsi, torch.tensor([[0.5, 2.0, 1.0, 0.1]]))
+
+    def test_rsi_selection_keeps_interval(self):
+        # RSI = [0.5, 2.0, 1.0, 0.1]. Interval [0.6, 1.5] keeps only the "typical" token (RSI = 1.0), dropping both the
+        # redundant low-surprisal token (0.1) and the unstable high-surprisal tail token (2.0).
+        per_token_logps = torch.tensor([[-0.5, -2.0, -1.0, -0.1]])
+        entropies = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        mask = torch.tensor([[1, 1, 1, 1]])
+        rsi_mask = self._rsi_selection_mask(per_token_logps, entropies, mask, low=0.6, high=1.5)
+        expected_mask = torch.tensor([[False, False, True, False]])
+        torch.testing.assert_close(rsi_mask, expected_mask)
+
+    def test_rsi_selection_inclusive_bounds(self):
+        # Bounds are inclusive: interval [0.5, 2.0] keeps RSI in {0.5, 2.0, 1.0} and drops only 0.1.
+        per_token_logps = torch.tensor([[-0.5, -2.0, -1.0, -0.1]])
+        entropies = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        mask = torch.tensor([[1, 1, 1, 1]])
+        rsi_mask = self._rsi_selection_mask(per_token_logps, entropies, mask, low=0.5, high=2.0)
+        expected_mask = torch.tensor([[True, True, True, False]])
+        torch.testing.assert_close(rsi_mask, expected_mask)
+
+    def test_rsi_selection_padding(self):
+        # Padding positions (mask = 0) are always masked out.
+        per_token_logps = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+        entropies = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        mask = torch.tensor([[1, 1, 0, 0]])
+        rsi_mask = self._rsi_selection_mask(per_token_logps, entropies, mask, low=0.5, high=1.5)
+        expected_mask = torch.tensor([[True, True, False, False]])
+        torch.testing.assert_close(rsi_mask, expected_mask)
+
+    def test_rsi_selection_one_sided(self):
+        # low = None keeps the lower end; high = None keeps the upper end.
+        per_token_logps = torch.tensor([[-0.5, -2.0, -1.0, -0.1]])
+        entropies = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        mask = torch.tensor([[1, 1, 1, 1]])
+
+        upper_only = self._rsi_selection_mask(per_token_logps, entropies, mask, low=None, high=1.5)
+        torch.testing.assert_close(upper_only, torch.tensor([[True, False, True, True]]))
+
+        lower_only = self._rsi_selection_mask(per_token_logps, entropies, mask, low=0.5, high=None)
+        torch.testing.assert_close(lower_only, torch.tensor([[True, True, True, False]]))
+
+    def test_rsi_selection_deterministic_token(self):
+        # A deterministic position (p = 1, H = 0) has RSI = 0, so it is treated as redundant and dropped by low > 0.
+        per_token_logps = torch.tensor([[0.0]])
+        entropies = torch.tensor([[0.0]])
+        mask = torch.tensor([[1]])
+        rsi = relative_surprisal_index(per_token_logps, entropies, mask)
+        torch.testing.assert_close(rsi, torch.tensor([[0.0]]))
+        rsi_mask = self._rsi_selection_mask(per_token_logps, entropies, mask, low=0.5, high=2.0)
+        torch.testing.assert_close(rsi_mask, torch.tensor([[False]]))
+
+    def test_rsi_config_passthrough(self):
+        # The RSI-S bounds are exposed on GRPOConfig and default to disabled (None).
+        config = GRPOConfig(output_dir=self.tmp_dir, use_cpu=True, rsi_selection_low=0.5, rsi_selection_high=2.0)
+        assert config.rsi_selection_low == 0.5
+        assert config.rsi_selection_high == 2.0
+
+        default_config = GRPOConfig(output_dir=self.tmp_dir, use_cpu=True)
+        assert default_config.rsi_selection_low is None
+        assert default_config.rsi_selection_high is None
 
 
 class TestGRPORolloutDispatch:

@@ -72,6 +72,7 @@ from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
+from .rsi_selection import rsi_selection_mask
 from .utils import (
     RepeatSampler,
     create_model_from_path,
@@ -662,6 +663,12 @@ class GRPOTrainer(_BaseTrainer):
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
             )
+        self.rsi_selection_low = args.rsi_selection_low
+        self.rsi_selection_high = args.rsi_selection_high
+        if self.use_liger_kernel and (self.rsi_selection_low is not None or self.rsi_selection_high is not None):
+            raise NotImplementedError(
+                "Liger Kernels don't currently support masking token positions based on the Relative Surprisal Index."
+            )
         if self.use_liger_kernel and self.importance_sampling_level not in ("token", "sequence"):
             raise ValueError(
                 f"Unknown importance sampling level: {self.importance_sampling_level}. "
@@ -1143,6 +1150,40 @@ class GRPOTrainer(_BaseTrainer):
         masked_entropies = entropies * mask.float()
         entropy_mask = masked_entropies >= entropy_threshold
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
+
+    def get_rsi_selection_mask(
+        self,
+        per_token_logps: torch.Tensor,
+        entropies: torch.Tensor,
+        mask: torch.Tensor,
+        low: float | None,
+        high: float | None,
+    ) -> torch.Tensor:
+        """
+        RSI Selection (RSI-S) mask from [Which Tokens Matter?](https://huggingface.co/papers/2606.31575).
+
+        Keeps tokens whose Relative Surprisal Index — the selected token's surprisal divided by the predictive
+        entropy (`-log p / H`) — falls within `[low, high]`. This drops redundant low-surprisal tokens (RSI < `low`)
+        and unstable high-surprisal tail tokens (RSI > `high`) in a single mask, reconciling entropy-only and
+        probability-only token selection.
+
+        Args:
+            per_token_logps (`torch.Tensor`):
+                Log-probabilities of the selected tokens, shape `(batch_size, seq_len)`.
+            entropies (`torch.Tensor`):
+                Predictive entropy at each position, shape `(batch_size, seq_len)`.
+            mask (`torch.Tensor`):
+                Binary mask where `1` indicates valid tokens and `0` padding.
+            low (`float` or `None`):
+                Lower RSI bound; `None` leaves the lower end unbounded.
+            high (`float` or `None`):
+                Upper RSI bound; `None` leaves the upper end unbounded.
+
+        Returns:
+            `torch.Tensor`:
+                Boolean mask of shape `(batch_size, seq_len)`, where `True` indicates kept tokens.
+        """
+        return rsi_selection_mask(per_token_logps, entropies, mask, low=low, high=high)
 
     @profiling_decorator
     def _get_per_token_logps_and_entropies(
@@ -2624,6 +2665,15 @@ class GRPOTrainer(_BaseTrainer):
         else:
             entropy_mask = None
 
+        # RSI Selection (RSI-S): keep tokens whose Relative Surprisal Index (-log p / H) lies in a stable interval,
+        # filtering redundant low-surprisal tokens and unstable high-surprisal tail tokens in one mask.
+        if self.rsi_selection_low is not None or self.rsi_selection_high is not None:
+            rsi_mask = self.get_rsi_selection_mask(
+                per_token_logps, entropies, mask, self.rsi_selection_low, self.rsi_selection_high
+            )
+        else:
+            rsi_mask = None
+
         # Compute the loss
         advantages = inputs["advantages"]
         # In the base GRPO implementation, advantages are expected to have shape (B,). To support subclasses that
@@ -2716,6 +2766,9 @@ class GRPOTrainer(_BaseTrainer):
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
+        if rsi_mask is not None:
+            per_token_loss = per_token_loss * rsi_mask
+
         if self.use_vllm and self.vllm_importance_sampling_correction and self.loss_type != "vespo":
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
@@ -2767,6 +2820,10 @@ class GRPOTrainer(_BaseTrainer):
 
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+        if rsi_mask is not None:
+            rsi_keep_ratio = rsi_mask.float().sum() / mask.sum().clamp(min=1.0)
+            self._metrics[mode]["rsi/keep_ratio"].append(self.accelerator.gather(rsi_keep_ratio).nanmean().item())
 
         if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
             # Compute the clipped probability ratios

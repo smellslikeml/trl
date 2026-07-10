@@ -47,6 +47,13 @@ class GRPOTrainer(_GRPOTrainer):
         else:
             entropy_mask = None
 
+        if self.rsi_selection_low is not None or self.rsi_selection_high is not None:
+            rsi_mask = self.get_rsi_selection_mask(
+                per_token_logps, entropies, completion_mask, self.rsi_selection_low, self.rsi_selection_high
+            )
+        else:
+            rsi_mask = None
+
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"]
@@ -100,6 +107,9 @@ class GRPOTrainer(_GRPOTrainer):
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
+        if rsi_mask is not None:
+            per_token_loss = per_token_loss * rsi_mask
+
         if self.use_vllm and self.vllm_importance_sampling_correction:
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
@@ -140,6 +150,10 @@ class GRPOTrainer(_GRPOTrainer):
 
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+        if rsi_mask is not None:
+            rsi_keep_ratio = rsi_mask.float().sum() / completion_mask.sum().clamp(min=1.0)
+            self._metrics[mode]["rsi/keep_ratio"].append(self.accelerator.gather(rsi_keep_ratio).nanmean().item())
 
         # Compute the clipped probability ratios
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
