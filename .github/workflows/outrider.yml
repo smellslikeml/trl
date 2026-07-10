@@ -30,6 +30,14 @@ on:
         description: 'Optional exact arxiv_id (e.g. 2402.02347v3). Bypasses selection and implements this specific paper. Use for reproducible re-runs.'
         required: false
         default: ''
+      publish:
+        description: 'pr (default) or branch — branch mode pushes without opening PR/Issue.'
+        required: false
+        default: 'pr'
+      lead-content:
+        description: 'Optional URL to a spec/gist that overrides suggested_experiment. Coding session reasons against the lead, not the paper method.'
+        required: false
+        default: ''
       claude-timeout:
         description: 'Wall-clock seconds for the Claude Code agent calls (preflight + implementation). Raise for very large monorepos; lower to cap cost.'
         required: false
@@ -120,6 +128,8 @@ jobs:
           # scheduled runs — the action uses its own defaults.
           search-method: ${{ inputs.search-method }}
           pin-arxiv: ${{ inputs.pin-arxiv }}
+          publish: ${{ inputs.publish }}
+          lead-content: ${{ inputs.lead-content }}
           claude-timeout: ${{ inputs.claude-timeout }}
           # Maps provider name → base URL. Adding more providers here
           # extends the table (Bedrock / Vertex / on-prem); leave
