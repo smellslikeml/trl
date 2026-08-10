@@ -38,16 +38,15 @@ class OffContextGRPOConfig(GRPOConfig):
     Reason on Hard Problems using Privileged Information](https://huggingface.co/papers/2607.19313v1).
 
     Parameters:
-        off_context_grpo_ratio (`float`, *optional*, defaults to `0.3`):
-            Fraction of rollouts (0.0 to 1.0) to generate with privileged guidance. For example, with
-            `off_context_grpo_ratio=0.3` and `num_generations=8`, approximately 2-3 generations per prompt will
-            use guidance and the rest will be unguided. This balances the benefit of guided rollouts with the
-            computational efficiency of standard GRPO.
+        off_context_grpo_ratio (`float`, *optional*, defaults to `0.0`):
+            **[DEPRECATED - use hint_trigger_threshold instead]** Fraction of rollouts (0.0 to 1.0) to generate
+            with privileged guidance. This parameter is kept for backward compatibility but adaptive hint
+            triggering via `hint_trigger_threshold` is preferred.
         guidance_func (`GuidanceFunc`, *optional*):
             A callable that provides privileged information for a given prompt. The function receives a single prompt
-            (string) and should return either a guidance string (e.g., a solution prefix, hint, or structured hint)
-            or `None` if no guidance is available for that prompt. The guidance is appended to the original prompt
-            during generation for guided rollouts only. For example:
+            (string or list of dict) and should return either a guidance string (e.g., a solution prefix, hint, or
+            structured hint) or `None` if no guidance is available for that prompt. The guidance is prepended to the
+            original prompt during generation for guided rollouts only. For example:
 
             ```python
             def math_guidance_func(prompt: str) -> str | None:
@@ -56,20 +55,46 @@ class OffContextGRPOConfig(GRPOConfig):
                     return "Hint: Start by identifying the key variables."
                 return None
             ```
+        hint_trigger_threshold (`int`, *optional*, defaults to `0`):
+            Adaptive hint triggering threshold. Hints are generated only for groups where the number of correct
+            completions (`n_correct`) is less than or equal to this threshold. A value of 0 means hints are only
+            used when the model produces zero correct solutions for a problem (all-zero reward groups). This focuses
+            guidance on learning cliffs where the model consistently fails, rather than on problems the model can
+            already solve.
+        hint_trigger_mode (`str`, *optional*, defaults to `"simple"`):
+            Mode for adaptive hint triggering. Options:
+            - `"simple"`: Hints are triggered when `n_correct <= hint_trigger_threshold` across all trajectories.
+            - `"two_phase"`: Two-phase trigger — hints are triggered only when the first half of trajectories are
+              all incorrect (`first_half_correct == 0`) AND the full set meets `n_correct <= hint_trigger_threshold`.
+              This stricter mode ensures hints are used only when the model consistently fails, reducing false
+              positives on stochastic successes.
     """
 
     off_context_grpo_ratio: float = field(
-        default=0.3,
+        default=0.0,
         metadata={
-            "help": "Fraction of rollouts to generate with privileged guidance. Must be between 0.0 and 1.0. "
-                    "Guided rollouts help overcome learning cliffs by steering generations toward correct solutions."
+            "help": "[DEPRECATED - use hint_trigger_threshold] Fraction of rollouts to generate with privileged guidance."
         },
     )
     guidance_func: GuidanceFunc | None = field(
         default=None,
         metadata={
-            "help": "A callable that provides privileged information for a given prompt. Receives a prompt string "
-                    "and returns guidance string or None. Guidance is only used for guided rollouts."
+            "help": "A callable that provides privileged information for a given prompt. Receives a prompt "
+                    "(string or list of dict) and returns guidance string or None. Guidance is prepended to prompts."
+        },
+    )
+    hint_trigger_threshold: int = field(
+        default=0,
+        metadata={
+            "help": "Adaptive hint triggering threshold. Hints are generated only for groups where n_correct <= "
+                    "this threshold. Default 0 means only zero-reward groups (all incorrect) receive hints."
+        },
+    )
+    hint_trigger_mode: str = field(
+        default="simple",
+        metadata={
+            "help": "Mode for hint triggering: 'simple' (n_correct <= threshold) or 'two_phase' (first_half "
+                    "all-zero AND n_correct <= threshold). Default is 'simple'."
         },
     )
 
@@ -82,4 +107,12 @@ class OffContextGRPOConfig(GRPOConfig):
         if self.off_context_grpo_ratio > 0.0 and self.guidance_func is None:
             raise ValueError(
                 "guidance_func must be provided when off_context_grpo_ratio > 0.0"
+            )
+        if self.hint_trigger_mode not in ("simple", "two_phase"):
+            raise ValueError(
+                f"hint_trigger_mode must be 'simple' or 'two_phase', got {self.hint_trigger_mode}"
+            )
+        if self.hint_trigger_threshold < 0:
+            raise ValueError(
+                f"hint_trigger_threshold must be >= 0, got {self.hint_trigger_threshold}"
             )

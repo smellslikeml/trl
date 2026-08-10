@@ -32,9 +32,12 @@ class OffContextGRPOTrainer(GRPOTrainer):
 
     This trainer extends [`GRPOTrainer`] with the following modifications:
 
-    1. A fraction of rollouts (`off_context_grpo_ratio`) are generated with privileged guidance.
-    2. The remaining rollouts are generated without guidance (standard GRPO).
-    3. Importance sampling correction is applied to guided rollouts to account for the distribution shift between
+    1. Adaptive hint triggering: After initial generation, identifies zero-reward groups where `n_correct <=
+       `hint_trigger_threshold` (default 0) and regenerates those groups with privileged guidance. This focuses
+       assistance on learning cliffs where the model consistently fails.
+    2. Two-phase trigger mode: When `hint_trigger_mode="two_phase"`, hints are only triggered when the first half
+       of trajectories are all incorrect AND the full set meets the threshold condition.
+    3. Importance sampling correction is applied to guided completions to account for the distribution shift between
        guided and unguided generation.
 
     Example:
@@ -57,7 +60,8 @@ class OffContextGRPOTrainer(GRPOTrainer):
     ...     reward_funcs=accuracy_reward,
     ...     train_dataset=dataset,
     ...     args=OffContextGRPOConfig(
-    ...         off_context_grpo_ratio=0.3,
+    ...         hint_trigger_threshold=0,  # Only hint when all completions are incorrect
+    ...         hint_trigger_mode="simple",  # Use "two_phase" for stricter triggering
     ...         guidance_func=math_guidance,
     ...     ),
     ... )
@@ -105,7 +109,8 @@ class OffContextGRPOTrainer(GRPOTrainer):
             args = OffContextGRPOConfig()
         super().__init__(args=args, **kwargs)
 
-        self.off_context_grpo_ratio = args.off_context_grpo_ratio
+        self.hint_trigger_threshold = args.hint_trigger_threshold
+        self.hint_trigger_mode = args.hint_trigger_mode
         self.guidance_func = args.guidance_func
 
     def _apply_guidance_to_prompts(self, prompts: list[str | list[dict]], guided_indices: list[int]) -> list[str | list[dict]]:
@@ -151,97 +156,193 @@ class OffContextGRPOTrainer(GRPOTrainer):
                 guided_prompts.append(prompt)
         return guided_prompts
 
-    def _generate_and_score_completions(
-        self, inputs: list[dict[str, torch.Tensor | Any]]
+    def _regenerate_zero_reward_groups(
+        self,
+        generation_batch: dict[str, torch.Tensor | Any],
+        zero_reward_groups: list[dict],
     ) -> dict[str, torch.Tensor | Any]:
         """
-        Generate completions with mixed guided and unguided rollouts.
+        Regenerate completions for zero-reward groups with guided prompts.
 
-        Overrides the parent method to:
-        1. Select a fraction of rollouts to receive guidance
-        2. Generate guided and unguided completions
-        3. Compute importance sampling ratios for guided rollouts
+        Args:
+            generation_batch: Original generation batch with prompts.
+            zero_reward_groups: List of zero-reward group info dicts containing:
+                - group_idx: Index of the prompt group
+                - sample_indices: List of sample indices in this group
+
+        Returns:
+            Updated generation_batch with regenerated completions for zero-reward groups.
         """
         device = self.accelerator.device
+        prompts = [x["prompt"] for x in generation_batch]
 
-        prompts = [x["prompt"] for x in inputs]
+        # Get group indices for prompting (one prompt per group)
+        num_generations = self.num_generations if self.model.training else self.num_generations_eval
+        num_groups = len(prompts) // num_generations
 
-        # Determine which prompts receive guidance
-        if self.off_context_grpo_ratio > 0.0 and self.guidance_func is not None:
-            num_prompts = len(prompts)
-            num_guided = int(num_prompts * self.off_context_grpo_ratio)
-            num_guided = max(1, num_guided)  # At least one guided rollout if ratio > 0
+        # Identify which groups receive guidance
+        guided_group_indices = [g["group_idx"] for g in zero_reward_groups]
+        guided_prompt_indices = [i * num_generations for i in guided_group_indices]  # First index in each group
 
-            # Randomly select which prompts receive guidance
-            if num_guided < num_prompts:
-                guided_indices = torch.randperm(num_prompts, device=device)[:num_guided].tolist()
+        # Apply guidance to selected prompts
+        guided_prompts = self._apply_guidance_to_prompts(prompts, guided_prompt_indices)
+
+        # Build new inputs for regeneration (only zero-reward groups)
+        regenerate_inputs = []
+        for group_info in zero_reward_groups:
+            group_idx = group_info["group_idx"]
+            sample_indices = group_info["sample_indices"]
+            for idx in sample_indices:
+                new_input = generation_batch.copy()
+                new_input["prompt"] = guided_prompts[group_idx * num_generations]
+                regenerate_inputs.append(new_input)
+
+        if not regenerate_inputs:
+            return generation_batch
+
+        # Generate with guidance
+        regenerated = super()._generate_and_score_completions(regenerate_inputs)
+
+        # Update original batch with regenerated completions
+        updated_batch = generation_batch.copy()
+        for i, group_info in enumerate(zero_reward_groups):
+            sample_indices = group_info["sample_indices"]
+            regenerated_idx_offset = i * num_generations
+            for j, orig_idx in enumerate(sample_indices):
+                regen_idx = regenerated_idx_offset + j
+                # Update all relevant fields
+                for key in regenerated:
+                    if key not in updated_batch:
+                        continue
+                    if isinstance(regenerated[key], torch.Tensor):
+                        updated_batch[key][orig_idx] = regenerated[key][regen_idx]
+                    elif isinstance(regenerated[key], list):
+                        updated_batch[key][orig_idx] = regenerated[key][regen_idx]
+
+        # Store which indices were guided for importance correction
+        is_guided = torch.zeros(len(prompts), dtype=torch.bool, device=device)
+        for group_info in zero_reward_groups:
+            for idx in group_info["sample_indices"]:
+                is_guided[idx] = True
+        updated_batch["is_guided"] = is_guided
+
+        return updated_batch
+
+    def _identify_zero_reward_groups(
+        self,
+        generation_batch: dict[str, torch.Tensor | Any],
+    ) -> list[dict]:
+        """
+        Identify zero-reward groups based on hint_trigger_threshold.
+
+        Groups where n_correct <= hint_trigger_threshold are selected for hint regeneration.
+
+        Args:
+            generation_batch: Batch with computed rewards.
+
+        Returns:
+            List of zero-reward group info dicts.
+        """
+        device = self.accelerator.device
+        num_generations = self.num_generations if self.model.training else self.num_generations_eval
+        num_groups = len(generation_batch["prompt"]) // num_generations
+
+        # Get reward sums for each completion
+        if "reward" in generation_batch:
+            rewards = generation_batch["reward"]
+            # Sum across reward functions if multiple
+            if rewards.dim() > 1:
+                reward_sums = rewards.sum(dim=-1)
             else:
-                guided_indices = list(range(num_prompts))
-
-            # Apply guidance to selected prompts
-            prompts = self._apply_guidance_to_prompts(prompts, guided_indices)
+                reward_sums = rewards
         else:
-            guided_indices = []
+            # No rewards computed yet (shouldn't happen in normal flow)
+            return []
 
-        # Store original prompts for reward computation (rewards use unguided prompts)
-        original_prompts = [x["prompt"] for x in inputs]
+        zero_reward_groups = []
+        for group_idx in range(num_groups):
+            start_idx = group_idx * num_generations
+            end_idx = start_idx + num_generations
+            group_rewards = reward_sums[start_idx:end_idx]
 
-        # Call parent's _generate_and_score_completions with potentially guided prompts
-        # We need to temporarily replace the prompts in inputs
-        original_inputs_prompts = [x["prompt"] for x in inputs]
-        for i, prompt in enumerate(prompts):
-            inputs[i]["prompt"] = prompt
+            n_correct = int((group_rewards > 0).sum())
+            n_total = num_generations
 
-        result = super()._generate_and_score_completions(inputs)
+            should_hint = False
+            if self.hint_trigger_mode == "two_phase":
+                half = n_total // 2
+                first_half_correct = int((group_rewards[:half] > 0).sum())
+                if first_half_correct == 0 and n_correct <= self.hint_trigger_threshold:
+                    should_hint = True
+            else:  # simple mode
+                if n_correct <= self.hint_trigger_threshold:
+                    should_hint = True
 
-        # Restore original prompts in inputs
-        for i, prompt in enumerate(original_inputs_prompts):
-            inputs[i]["prompt"] = prompt
+            if should_hint:
+                zero_reward_groups.append({
+                    "group_idx": group_idx,
+                    "sample_indices": list(range(start_idx, end_idx)),
+                    "n_correct": n_correct,
+                })
 
-        # Compute importance sampling ratios for guided rollouts
-        # For guided rollouts, we need to correct for the distribution shift
-        # between guided generation (π_guided) and target unguided generation (π_unguided)
-        if guided_indices:
-            result["guided_indices"] = guided_indices
-            # Store guidance information for importance correction
-            result["is_guided"] = torch.zeros(len(original_prompts), dtype=torch.bool, device=device)
-            result["is_guided"][guided_indices] = True
+        return zero_reward_groups
 
-        return result
-
-    def _compute_loss(self, model, inputs):
+    def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         """
-        Compute loss with importance correction for guided rollouts.
+        Override to add adaptive hint regeneration.
 
-        Overrides the parent method to apply additional importance sampling correction
-        for completions generated with guidance.
+        Flow:
+        1. Generate initial completions without hints
+        2. Compute rewards
+        3. Identify zero-reward groups (n_correct <= hint_trigger_threshold)
+        4. Regenerate those groups with hints
+        5. Return updated batch
         """
-        # Check if any rollouts were guided
-        is_guided = inputs.get("is_guided")
-        if is_guided is None or not is_guided.any():
-            # No guided rollouts, use parent's loss computation
-            return super()._compute_loss(model, inputs)
+        mode = "train" if self.model.training else "eval"
 
-        # For guided rollouts, we need to apply importance correction
-        # The guided rollouts are sampled from π_guided but we want to optimize for π_unguided
-        # We apply an additional importance weight: π_unguided / π_guided
+        # Skip adaptive hints if guidance_func not provided or hints disabled
+        if self.guidance_func is None or self.hint_trigger_threshold < 0:
+            return super()._prepare_inputs(generation_batch)
 
-        # For simplicity in this implementation, we use a heuristic correction:
-        # Guided rollouts have higher log-probs under the guided prompt, so we apply
-        # a scaling factor to compensate. This is a simplified version of the full
-        # importance correction described in the paper.
+        # During training, we need to handle the generation batch differently for adaptive hints
+        if mode == "train":
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                # First pass: generate without hints, compute rewards
+                generation_batch = super()._generate_and_score_completions(generation_batch)
 
-        # Get the base loss from parent
-        loss = super()._compute_loss(model, inputs)
+                # Identify zero-reward groups
+                zero_reward_groups = self._identify_zero_reward_groups(generation_batch)
 
-        # Apply importance correction by scaling guided rollouts
-        # This is a minimal implementation - a full version would compute the exact
-        # importance sampling ratio using the model's log-probs under both prompts
+                # Log metrics
+                num_generations = self.num_generations
+                num_groups = len(generation_batch["prompt"]) // num_generations
+                n_hinted = len(zero_reward_groups)
+                self._metrics["train"]["hint_trigger_threshold"] = self.hint_trigger_threshold
+                self._metrics["train"]["n_hint_candidates"] = n_hinted
+                self._metrics["train"]["pct_hinted"] = n_hinted / max(num_groups, 1)
 
-        # The correction factor compensates for the distribution shift
-        # In practice, this would be computed as exp(log_pi_unguided - log_pi_guided)
-        # For this minimal implementation, we use the fact that guided rollouts
-        # are already getting higher rewards and let the standard GRPO importance
-        # weights handle the correction
+                # Second pass: regenerate zero-reward groups with hints
+                if zero_reward_groups:
+                    generation_batch = self._regenerate_zero_reward_groups(
+                        generation_batch, zero_reward_groups
+                    )
 
-        return loss
+                from ...trainer.grpo_trainer import shuffle_sequence_dict, split_tensor_dict, split_pixel_values_by_grid, unsplit_pixel_values_by_grid
+
+                generation_batch = split_pixel_values_by_grid(generation_batch)
+                generation_batch = shuffle_sequence_dict(generation_batch)
+                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+        else:
+            # In evaluation, generate first, then identify and regenerate
+            generation_batch = super()._generate_and_score_completions(generation_batch)
+            zero_reward_groups = self._identify_zero_reward_groups(generation_batch)
+            if zero_reward_groups:
+                generation_batch = self._regenerate_zero_reward_groups(
+                    generation_batch, zero_reward_groups
+                )
+            inputs = generation_batch
+
+        return inputs
