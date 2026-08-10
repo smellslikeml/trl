@@ -288,6 +288,38 @@ training_args = GRPOConfig(
 )
 ```
 
+### Off-Context GRPO: Learning to Reason on Hard Problems using Privileged Information
+
+**📜 Paper**: https://huggingface.co/papers/2607.19313v1
+
+Off-Context GRPO (OC-GRPO) addresses the learning cliff problem in reinforcement learning with verifiable rewards. When a model cannot generate correct solutions on hard problems, it receives zero learning signal. OC-GRPO overcomes this by using privileged information (e.g., solution prefixes or hints) during training to guide generations toward correct solutions, while applying importance correction to steer the update back toward the original unguided objective. The method achieves a 3.9% absolute improvement (13.8% relative gain) over vanilla GRPO on mathematical reasoning benchmarks.
+
+TRL provides an experimental implementation via [`OffContextGRPOTrainer`]:
+
+```python
+from trl.experimental.off_context_grpo import OffContextGRPOConfig, OffContextGRPOTrainer
+
+def math_guidance(prompt: str) -> str | None:
+    """Provide hints for math problems."""
+    if "solve" in prompt.lower() or "calculate" in prompt.lower():
+        return "Hint: Start by identifying the key variables. "
+    return None
+
+training_args = OffContextGRPOConfig(
+    off_context_grpo_ratio=0.3,  # Fraction of rollouts to use guidance
+    guidance_func=math_guidance,  # Function providing privileged information
+    report_to="none",
+)
+
+trainer = OffContextGRPOTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    reward_funcs=accuracy_reward,
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
 ### Part I: Tricks or Traps? A Deep Dive into RL for LLM Reasoning (Lite PPO)
 
 **📜 Paper**: https://huggingface.co/papers/2508.08221
