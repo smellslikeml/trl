@@ -114,7 +114,7 @@ jobs:
           - For files > 500 LOC where you only need one function, prefer AST search
             + targeted Read over reading the whole file.
           EOF
-      - uses: remyxai/outrider@feat/injection-mitigations-v1
+      - uses: remyxai/outrider@v1
         with:
           interest-id: f833f520-ee41-40ab-a553-40dc9756db01
           # Minimum days between recommendation PRs on this repo. '0' lets
