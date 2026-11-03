@@ -980,6 +980,13 @@ class GRPOTrainer(_BaseTrainer):
                 "(see https://huggingface.co/docs/trl/main/en/paper_index#group-sequence-policy-optimization)."
             )
 
+        if args.importance_sampling_level == "prefix" and args.loss_type != "grpo":
+            logger.warning(
+                "When using `importance_sampling_level='prefix'`, the EPIC surrogate replaces the loss-type "
+                "surrogate and only the token aggregation is left to `loss_type`. To reproduce the EPIC paper's "
+                "objective, set `loss_type='grpo'`."
+            )
+
         if self.loss_type == "vespo" and self.use_vllm and self.vllm_importance_sampling_correction:
             if self.vllm_importance_sampling_mode not in ["token_truncate", "token_mask"]:
                 raise ValueError(
@@ -991,6 +998,8 @@ class GRPOTrainer(_BaseTrainer):
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        self.prefix_kl_delta = args.prefix_kl_delta
+        self.prefix_kl_delta_high = args.prefix_kl_delta_high
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
@@ -3138,6 +3147,44 @@ class GRPOTrainer(_BaseTrainer):
 
         return phi_seq  # (B, 1)
 
+    @staticmethod
+    @torch.no_grad()
+    def get_epic_phi_log_roots(targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Solves φ(r) = `targets` for the exact-KL coordinate φ(r) = r − 1 − log r, as needed by
+        `importance_sampling_level="prefix"` (EPIC). φ is strictly convex with its minimum φ(1) = 0, so every
+        target κ ≥ 0 has exactly one root ℓ ≤ 1 and one root u ≥ 1.
+
+        Args:
+            targets (`torch.Tensor`):
+                Tensor of non-negative targets κ, of any shape.
+
+        Returns:
+            `tuple[`torch.Tensor`, `torch.Tensor`]`: `log ℓ` (≤ 0) and `log u` (≥ 0), both with the shape of
+            `targets`. The roots are returned in log space because EPIC uses them through the geometric
+            (1/t) exponent, where the ratio itself would underflow for long, unlikely prefixes.
+        """
+        # Newton iteration in s = |log r|, which maps the two roots onto s ≥ 0: φ(e⁻ˢ) = e⁻ˢ − 1 + s and
+        # φ(e⁺ˢ) = eˢ − 1 − s. Both are increasing and convex in s, so starting from a point where they are
+        # positive keeps the iterates above the root, and they converge without ever leaving s ≥ 0. A zero budget
+        # is the degenerate unclipped case where both roots collapse onto r = 1.
+        dtype = targets.dtype
+        # φ(r) ≈ (r − 1)²/2 around r = 1 (φ'(1) = 0), which makes small budgets a numerical double root in fp32,
+        # so iterate in double precision and cast back. The targets are clamped in double space because κ = t·δ/p̄
+        # can overflow fp32 to inf for unlikely prefixes (tiny p̄), and at either clamp limit the bounds are the
+        # degenerate (1, 1) / (0, inf) ones to within float precision.
+        targets = targets.double().clamp(min=1e-12, max=1e300)
+        # φ(e^-(κ+2)) = e^-(κ+2) + 1 > 0 and φ(e^(log1p(κ)+2)) = (e² − 1)·κ + e² − 3 − log1p(κ) > 0: safe starts
+        s_low = targets + 2.0
+        s_high = torch.log1p(targets) + 2.0
+        for _ in range(40):
+            # Written with e⁻ˢ only, so that large budgets underflow harmlessly instead of overflowing eˢ to inf
+            inv_exp = torch.exp(-s_low)
+            s_low = s_low - (inv_exp - 1.0 + s_low - targets) / (1.0 - inv_exp)
+            inv_exp = torch.exp(-s_high)
+            s_high = s_high - (1.0 - (1.0 + s_high + targets) * inv_exp) / (1.0 - inv_exp)
+        return -s_low.to(dtype), s_high.to(dtype)
+
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -3208,10 +3255,15 @@ class GRPOTrainer(_BaseTrainer):
         elif self.importance_sampling_level == "sequence":
             log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
+        elif self.importance_sampling_level == "prefix":
+            # EPIC clips the cumulative prefix ratio: at position t the weight is the geometric mean
+            # g_{i,t} = (r_pre_{i,t})^(1/t) of the prefix ratios, where t is the running count of valid tokens
+            prefix_lengths = mask.cumsum(-1)
+            log_importance_weights = (log_ratio * mask).cumsum(-1) / prefix_lengths.clamp(min=1.0)
         else:
             raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
+                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token', "
+                "'sequence', and 'prefix'."
             )
 
         coef_1 = torch.exp(log_importance_weights)
@@ -3227,8 +3279,30 @@ class GRPOTrainer(_BaseTrainer):
                 per_token_kl = per_token_kl * coef_1
 
         # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
-        if self.loss_type == "cispo":
+        # importance_sampling_level: "token" and "prefix" levels: (B, T); "sequence" level: (B, 1)
+        if self.importance_sampling_level == "prefix":
+            # EPIC (https://huggingface.co/papers/2610.29999) clips the geometric prefix weight into a trust region
+            # derived from the exact-KL coordinate φ(r) = r − 1 − log r: the bounds are the roots of
+            # φ(ℓ) = t·δ⁻/p̄ and φ(u) = t·δ⁺/p̄, where p̄ is the geometric mean of the behavior policy
+            # probabilities over the prefix. The behavior policy is the one behind `old_per_token_logps`. The roots
+            # are bounds on the raw prefix ratio, so they are brought to the geometric scale with the same 1/t
+            # exponent as the weight itself. This surrogate replaces the loss-type one.
+            p_bar = torch.exp((old_per_token_logps * mask).cumsum(-1) / prefix_lengths.clamp(min=1.0))
+            log_lower_root, _ = self.get_epic_phi_log_roots(prefix_lengths * self.prefix_kl_delta / p_bar)
+            _, log_upper_root = self.get_epic_phi_log_roots(prefix_lengths * self.prefix_kl_delta_high / p_bar)
+            prefix_lower = torch.exp(log_lower_root / prefix_lengths.clamp(min=1.0))
+            prefix_upper = torch.exp(log_upper_root / prefix_lengths.clamp(min=1.0))
+            # Straight-through weight: it takes the value of the prefix weight g_{i,t}, but only the current
+            # token's log-probability carries gradient (∇g̃ = g·∇log π_θ(o_t)), so the prefix history is detached
+            weight = coef_1.detach() * torch.exp(per_token_logps - per_token_logps.detach())
+            # Sign-aware clipping: for A ≥ 0 only the upper bound bites (as in PPO), for A < 0 the weight is
+            # clamped into the full interval
+            per_token_loss = -torch.where(
+                advantages >= 0,
+                advantages * torch.minimum(weight, prefix_upper),
+                advantages * torch.clamp(weight, min=prefix_lower, max=prefix_upper),
+            )
+        elif self.loss_type == "cispo":
             clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
             per_token_loss = -clamped_ratios * advantages * per_token_logps
         elif self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
@@ -3392,9 +3466,14 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["entropy"].append(global_masked_mean(entropies))
 
         if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
-            # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            # Compute the clipped probability ratios. EPIC clips into position-dependent prefix bounds rather than
+            # the fixed [1 - ε_low, 1 + ε_high] range.
+            if self.importance_sampling_level == "prefix":
+                lower_bound, upper_bound = prefix_lower, prefix_upper
+            else:
+                lower_bound, upper_bound = 1 - self.epsilon_low, 1 + self.epsilon_high
+            is_low_clipped = (coef_1 < lower_bound) & (advantages < 0)
+            is_high_clipped = (coef_1 > upper_bound) & (advantages > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
             self._metrics[mode]["clip_ratio/low_mean"].append(global_masked_mean(is_low_clipped.float()))
             self._metrics[mode]["clip_ratio/high_mean"].append(global_masked_mean(is_high_clipped.float()))

@@ -206,11 +206,26 @@ class GRPOConfig(_BaseConfig):
             how aggressively we down-weight samples with high importance weights (when the importance sampling ratio >
             1).
         importance_sampling_level (`str`, *optional*, defaults to `"token"`):
-            Controls whether importance sampling ratios are computed at the `"token"` or `"sequence"` level. `"token"`
-            keeps the raw per-token log-probability ratios (one weight per token). `"sequence"` averages the
-            log-probability ratios across valid tokens to produce a single ratio per sequence. The [GSPO
+            Controls whether importance sampling ratios are computed at the `"token"`, `"sequence"`, or `"prefix"`
+            level. `"token"` keeps the raw per-token log-probability ratios (one weight per token). `"sequence"`
+            averages the log-probability ratios across valid tokens to produce a single ratio per sequence. The [GSPO
             paper](https://huggingface.co/papers/2507.18071) shows that sequence-level sampling often yields more
-            stable training and better alignment with sequence-level rewards.
+            stable training and better alignment with sequence-level rewards. `"prefix"` clips the cumulative prefix
+            log-probability ratio at every position into position-dependent bounds derived from the exact-KL
+            coordinate φ(r) = r − 1 − log r, as introduced in the [EPIC
+            paper](https://huggingface.co/papers/2610.29999). It replaces the loss-type surrogate with its own and
+            pairs with `loss_type="grpo"` and the `prefix_kl_delta`/`prefix_kl_delta_high` budgets.
+        prefix_kl_delta (`float`, *optional*, defaults to `5e-4`):
+            δ⁻ lower trust-region budget used when `importance_sampling_level="prefix"` (EPIC). At each position the
+            lower bound ℓ solves φ(ℓ) = t·δ⁻ / p̄, where t is the 1-based prefix length, p̄ the geometric mean of the
+            behavior policy probabilities over the prefix, and φ(r) = r − 1 − log r the exact-KL coordinate. The [EPIC
+            paper](https://huggingface.co/papers/2610.29999) recommends `5e-4`. Has no effect for the other
+            importance sampling levels.
+        prefix_kl_delta_high (`float`, *optional*, defaults to `2e-3`):
+            δ⁺ upper trust-region budget used when `importance_sampling_level="prefix"` (EPIC). At each position the
+            upper bound u solves φ(u) = t·δ⁺ / p̄, with t, p̄ and φ as in `prefix_kl_delta`. The [EPIC
+            paper](https://huggingface.co/papers/2610.29999) recommends `2e-3`. Has no effect for the other
+            importance sampling levels.
         reward_weights (`list[float]`, *optional*):
             Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are
             weighted equally with weight `1.0`.
@@ -762,11 +777,33 @@ class GRPOConfig(_BaseConfig):
     importance_sampling_level: str = field(
         default="token",
         metadata={
-            "help": "Controls whether importance sampling ratios are computed at the `'token'` or `'sequence'` level. "
-            "`'token'` keeps the raw per-token log-probability ratios (one weight per token). `'sequence'` averages "
-            "the log-probability ratios across valid tokens to produce a single ratio per sequence. The GSPO paper "
-            "shows that sequence-level sampling often yields more stable training and better alignment with "
-            "sequence-level rewards."
+            "help": "Controls whether importance sampling ratios are computed at the `'token'`, `'sequence'`, or "
+            "`'prefix'` level. `'token'` keeps the raw per-token log-probability ratios (one weight per token). "
+            "`'sequence'` averages the log-probability ratios across valid tokens to produce a single ratio per "
+            "sequence. The GSPO paper shows that sequence-level sampling often yields more stable training and "
+            "better alignment with sequence-level rewards. `'prefix'` clips the cumulative prefix log-probability "
+            "ratio at every position into position-dependent bounds derived from the exact-KL coordinate "
+            "phi(r) = r - 1 - log r, as introduced in the EPIC paper. It replaces the loss-type surrogate with its "
+            "own and pairs with `loss_type='grpo'` and the `prefix_kl_delta`/`prefix_kl_delta_high` budgets."
+        },
+    )
+    prefix_kl_delta: float = field(
+        default=5e-4,
+        metadata={
+            "help": "delta^- lower trust-region budget used when `importance_sampling_level='prefix'` (EPIC). At each "
+            "position the lower bound ell solves phi(ell) = t * delta^- / p_bar, where t is the 1-based prefix "
+            "length, p_bar the geometric mean of the behavior policy probabilities over the prefix, and "
+            "phi(r) = r - 1 - log r the exact-KL coordinate. The EPIC paper recommends 5e-4. Has no effect for the "
+            "other importance sampling levels."
+        },
+    )
+    prefix_kl_delta_high: float = field(
+        default=2e-3,
+        metadata={
+            "help": "delta^+ upper trust-region budget used when `importance_sampling_level='prefix'` (EPIC). At each "
+            "position the upper bound u solves phi(u) = t * delta^+ / p_bar, with t, p_bar and phi as in "
+            "`prefix_kl_delta`. The EPIC paper recommends 2e-3. Has no effect for the other importance sampling "
+            "levels."
         },
     )
     reward_weights: list[float] | None = field(
