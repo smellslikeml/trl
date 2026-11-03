@@ -149,6 +149,51 @@ class TestGetHighEntropyMask(TrlTestCase):
         torch.testing.assert_close(entropy_mask, expected_mask)
 
 
+class TestGetEpicPhiLogRoots(TrlTestCase):
+    def get_roots(self, targets):
+        log_lower, log_upper = GRPOTrainer.get_epic_phi_log_roots(targets)
+        return log_lower.exp(), log_upper.exp()
+
+    def test_roots_recover_the_budget(self):
+        # φ(r) = r − 1 − log r is strictly convex with its minimum φ(1) = 0, so every budget κ has exactly one
+        # root ℓ < 1 and one root u > 1, and φ of each root must recover the budget. The lower root decays like
+        # e^−κ, so past κ ~ 700 it is no longer representable as a ratio (hence the log-space return).
+        def phi(r):
+            return r - 1 - torch.log(r)
+
+        targets = torch.logspace(-8, 2, 21, dtype=torch.float64)
+        lower, upper = self.get_roots(targets)
+        assert torch.all(lower < 1) and torch.all(upper > 1)
+        torch.testing.assert_close(phi(lower), targets, rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(phi(upper), targets, rtol=1e-6, atol=1e-12)
+
+        # the float32 path the trainer takes
+        log_lower, log_upper = GRPOTrainer.get_epic_phi_log_roots(targets.to(torch.float32))
+        torch.testing.assert_close(phi(log_lower.double().exp()), targets, rtol=1e-4, atol=1e-8)
+        torch.testing.assert_close(phi(log_upper.double().exp()), targets, rtol=1e-4, atol=1e-8)
+
+    def test_roots_follow_the_budget(self):
+        # A looser budget loosens both bounds, and a zero budget degenerates to the unclipped ratio r = 1
+        targets = torch.logspace(-6, 6, 13, dtype=torch.float64)
+        lower, upper = self.get_roots(targets)
+        looser_lower, looser_upper = self.get_roots(targets * 100.0)
+        assert torch.all(looser_lower <= lower) and torch.all(looser_upper >= upper)
+
+        zero_lower, zero_upper = self.get_roots(torch.zeros(3, dtype=torch.float64))
+        torch.testing.assert_close(zero_lower, torch.ones(3, dtype=torch.float64), rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(zero_upper, torch.ones(3, dtype=torch.float64), rtol=1e-4, atol=1e-6)
+
+    def test_extreme_budgets_degrade_to_degenerate_bounds(self):
+        # Long prefixes with a low behavior probability give budgets far past what exp() can represent — the
+        # budget can even overflow the float32 range entirely (t·δ/p̄ > ~3e38 for a tiny p̄). The bounds must
+        # degrade to the degenerate (0, inf) ones rather than to nan, so that clipping simply stops biting
+        log_lower, log_upper = GRPOTrainer.get_epic_phi_log_roots(torch.tensor([1e6, 1e20, 1e30, float("inf")]))
+        assert not torch.isnan(log_lower).any() and not torch.isnan(log_upper).any()
+        assert torch.all(log_lower <= 0) and torch.all(log_upper >= 0)
+        lower, upper = log_lower.exp(), log_upper.exp()
+        assert torch.all((lower >= 0) & (lower <= 1)) and torch.all(upper >= 1)
+
+
 class TestGRPORolloutDispatch(TrlTestCase):
     def _make_rollout_func(self, **output):
         # A plain callable, as a user passes, recording the calls it gets
@@ -2227,6 +2272,201 @@ class TestGRPOTrainer(TrlTestCase):
         loss_after = trainer._compute_loss(trainer.model, perturbed_inputs)
 
         torch.testing.assert_close(loss_before, loss_after)
+
+    def _build_prefix_fixture(self, **config):
+        # Shared fixture for the importance_sampling_level="prefix" (EPIC) checks: a trainer plus hand-built
+        # inputs whose old log-probs sit at a fixed offset from the model's, so the prefix ratio is meaningfully
+        # off 1 (on-policy ratios are exactly 1 and never leave the trust region). The offsets are spread out so
+        # that both sides of the trust region are exercised. As in test_luspo_loss_ignores_padding,
+        # _compute_loss is called directly: the prefix weights and bounds are internal to the loss, so this is
+        # the only way to check their values. Seeded so that two fixtures (e.g. the prefix and sequence levels)
+        # see identical inputs and model log-probs.
+        torch.manual_seed(0)
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            loss_type="grpo",  # the aggregation the EPIC paper pairs with the prefix level
+            report_to="none",
+            **config,
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+        trainer.model.eval()
+
+        device = next(trainer.model.parameters()).device
+        batch_size, prompt_len, completion_len = 3, 3, 6
+        prompt_ids = torch.randint(1, 1000, (batch_size, prompt_len), device=device)
+        prompt_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
+        completion_ids = torch.randint(1, 1000, (batch_size, completion_len), device=device)
+        completion_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0], [1, 1, 0, 0, 0, 0]], device=device)
+        with torch.no_grad():
+            per_token_logps, _, _ = trainer._get_per_token_logps_and_entropies(
+                trainer.model,
+                torch.cat([prompt_ids, completion_ids], dim=1),
+                torch.cat([prompt_mask, completion_mask], dim=1),
+                completion_len,
+            )
+        offsets = torch.linspace(-3.5, 3.5, batch_size * completion_len).reshape(batch_size, completion_len).to(device)
+        inputs = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": torch.tensor([1.0, -2.0, 0.5], device=device),  # both signs of the clip operator
+            "old_per_token_logps": per_token_logps + offsets,
+        }
+        return trainer, inputs, per_token_logps
+
+    @staticmethod
+    def _prefix_weights(per_token_logps, old_per_token_logps, completion_mask):
+        # Independent (scalar-loop) reimplementation of the prefix weight: at position t it is the geometric mean
+        # g_{i,t} = (prod_{k<=t} r_{i,k})^(1/t) of the token ratios over the valid prefix
+        weights = torch.zeros_like(per_token_logps)
+        for i in range(per_token_logps.size(0)):
+            for t in range(int(completion_mask[i].sum())):
+                log_g = (per_token_logps[i, : t + 1] - old_per_token_logps[i, : t + 1]).sum() / (t + 1)
+                weights[i, t] = log_g.exp()
+        return weights
+
+    def test_prefix_importance_weights(self):
+        # With the trust region wide open, the prefix loss reduces to the per-sequence mean of A * g_{i,t}, where
+        # g_{i,t} is the geometric mean of the prefix token ratios: the cumulative sum of the log ratios, divided
+        # by the running count of valid tokens.
+        trainer, inputs, per_token_logps = self._build_prefix_fixture(
+            importance_sampling_level="prefix", prefix_kl_delta=1e30, prefix_kl_delta_high=1e30
+        )
+        weights = self._prefix_weights(per_token_logps, inputs["old_per_token_logps"], inputs["completion_mask"])
+
+        with torch.no_grad():
+            loss = trainer._compute_loss(trainer.model, inputs)
+
+        advantages, mask = inputs["advantages"], inputs["completion_mask"]
+        per_sequence = [
+            -(advantages[i] * weights[i, : int(mask[i].sum())]).sum() / int(mask[i].sum())
+            for i in range(weights.size(0))
+        ]
+        torch.testing.assert_close(loss, torch.stack(per_sequence).mean().to(loss.device), rtol=1e-5, atol=1e-7)
+
+        # At the last valid position the prefix weight is exactly the sequence-level geometric-mean ratio, so the
+        # sequence level must reproduce that term alone: with epsilon wide enough not to clip, its loss is
+        # -mean_i(A_i * exp(mean_t d_{i,t}))
+        sequence_trainer, sequence_inputs, _ = self._build_prefix_fixture(
+            importance_sampling_level="sequence", epsilon=1e30
+        )
+        with torch.no_grad():
+            sequence_loss = sequence_trainer._compute_loss(sequence_trainer.model, sequence_inputs)
+        per_sequence = []
+        for i in range(weights.size(0)):
+            n = int(mask[i].sum())
+            log_ratio = per_token_logps[i, :n] - inputs["old_per_token_logps"][i, :n]
+            per_sequence.append(-advantages[i] * log_ratio.mean().exp())
+            # the term the two levels share: the prefix weight at t = n and the sequence-level ratio
+            torch.testing.assert_close(weights[i, n - 1], log_ratio.mean().exp())
+        torch.testing.assert_close(sequence_loss, torch.stack(per_sequence).mean().to(sequence_loss.device))
+
+    @pytest.mark.parametrize(
+        ("delta", "delta_high", "expected_weight"),
+        [
+            # The sign-aware clip C(q, A; l, u) = A*min(q, u) for A >= 0 and A*min(max(q, l), u) for A < 0, with
+            # the bounds pushed to their limits by the budgets: a tiny budget collapses them onto 1, a huge one
+            # opens that side entirely. The collapsing budget must be small relative to p_bar (the bounds move like
+            # sqrt(2*delta/p_bar)), so it is chosen far below any geometric-mean token probability a model assigns.
+            # Only A < 0 feels the lower bound, and the upper bound caps the term for both signs (where EPIC
+            # differs from the pessimistic PPO min form).
+            (
+                1e-20,
+                1e-20,
+                lambda q, is_pos: torch.ones_like(q) if not is_pos else torch.minimum(q, torch.ones_like(q)),
+            ),
+            (1e-20, 1e30, lambda q, is_pos: q if is_pos else torch.maximum(q, torch.ones_like(q))),
+            (1e30, 1e-20, lambda q, is_pos: torch.minimum(q, torch.ones_like(q))),
+        ],
+    )
+    def test_prefix_clipping(self, delta, delta_high, expected_weight):
+        trainer, inputs, per_token_logps = self._build_prefix_fixture(
+            importance_sampling_level="prefix", prefix_kl_delta=delta, prefix_kl_delta_high=delta_high
+        )
+        weights = self._prefix_weights(per_token_logps, inputs["old_per_token_logps"], inputs["completion_mask"])
+
+        with torch.no_grad():
+            loss = trainer._compute_loss(trainer.model, inputs)
+
+        advantages, mask = inputs["advantages"], inputs["completion_mask"]
+        per_sequence = []
+        for i in range(weights.size(0)):
+            n = int(mask[i].sum())
+            weight = expected_weight(weights[i, :n], bool(advantages[i] >= 0))
+            per_sequence.append(-(advantages[i] * weight).sum() / n)
+        torch.testing.assert_close(loss, torch.stack(per_sequence).mean().to(loss.device), rtol=1e-4, atol=1e-5)
+
+    def test_prefix_clipping_engages_with_paper_budgets(self):
+        # The default (paper) budgets must be tight enough to actually clip somewhere, and loose enough not to
+        # clip everywhere, unlike the wide-open and collapsed extremes above.
+        open_trainer, inputs, per_token_logps = self._build_prefix_fixture(
+            importance_sampling_level="prefix", prefix_kl_delta=1e30, prefix_kl_delta_high=1e30
+        )
+        with torch.no_grad():
+            open_loss = open_trainer._compute_loss(open_trainer.model, inputs)
+
+        default_trainer, *_ = self._build_prefix_fixture(importance_sampling_level="prefix")
+        with torch.no_grad():
+            default_loss = default_trainer._compute_loss(default_trainer.model, inputs)
+
+        region_mean = default_trainer._metrics["eval"]["clip_ratio/region_mean"][-1]
+        assert 0.0 < region_mean < 1.0, region_mean
+        assert not torch.allclose(default_loss, open_loss)
+
+    def test_prefix_loss_ignores_padding(self):
+        # The cumulative prefix ratio must only accumulate over valid tokens: perturbing the old log-probs at
+        # padded positions cannot change the loss.
+        trainer, inputs, _ = self._build_prefix_fixture(importance_sampling_level="prefix")
+        with torch.no_grad():
+            loss_before = trainer._compute_loss(trainer.model, inputs)
+
+        perturbed_inputs = dict(inputs)
+        perturbed_inputs["old_per_token_logps"] = inputs["old_per_token_logps"].clone()
+        perturbed_inputs["old_per_token_logps"][inputs["completion_mask"] == 0] += 1.0
+        with torch.no_grad():
+            loss_after = trainer._compute_loss(trainer.model, perturbed_inputs)
+
+        torch.testing.assert_close(loss_before, loss_after)
+
+    def test_train_importance_sampling_level_prefix(self):
+        # EPIC prefix clipping must run end to end: finite loss, and gradients reaching the policy
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            importance_sampling_level="prefix",
+            loss_type="grpo",  # the aggregation the EPIC paper pairs with the prefix level
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
+        assert losses and torch.isfinite(torch.tensor(losses)).all(), losses
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_adaptive_entropy_gradient_accumulation(self):
         # Adaptive entropy must behave correctly under gradient accumulation: the coefficient and gating are
