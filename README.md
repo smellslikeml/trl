@@ -22,9 +22,15 @@
 
 ## 🎉 What's New
 
-**TRL v1:** We released TRL v1 — a major milestone that marks a real shift in what TRL is. Read the [blog post](https://huggingface.co/blog/trl-v1) to learn more.
+**🔥 Mistral Large 4:** Fine-tune [Mistral Large 4](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) with [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer) on a single node of 8 B300s, on top of its FP8 weights. See the [LoRA example](https://github.com/huggingface/trl/tree/main/examples/sft_mistral_large_4).
 
-**🚢 Harbor:** We now support [Harbor](https://huggingface.co/docs/trl/harbor) — train agents against sandboxed task suites (instruction + sandbox image + in-sandbox verifier) via [`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer)'s `environment_factory`.
+**🚀 Training on AMD GPUs:** TRL's trainers now run on [AMD Instinct GPUs](https://huggingface.co/docs/trl/amd_gpus) through PyTorch's ROCm build.
+
+**🔥 Beam:** Fine-tune [Beam](https://huggingface.co/reflection/Beam-1.0-501B-A23B) with [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer) on a single node of 8 B300s. See the [LoRA example](https://github.com/huggingface/trl/tree/main/examples/sft_beam).
+
+**🔥 Muse Spark Open:** Fine-tune [Muse Spark Open](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B) with [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer), sharded across your GPUs at load time. See the [8-node LoRA example](https://github.com/huggingface/trl/tree/main/examples/sft_muse_spark_open).
+
+**🚀 Training on AWS Trainium:** TRL's trainers now run on [AWS Trainium](https://huggingface.co/docs/trl/aws_trainium) through TorchNeuron, PyTorch's native Neuron backend.
 
 ## Overview
 
@@ -32,7 +38,7 @@ TRL is a cutting-edge library designed for post-training foundation models using
 
 ## Highlights
 
-- **Trainers**: Various fine-tuning methods are easily accessible via trainers like [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer), [`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer), [`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer), [`RewardTrainer`](https://huggingface.co/docs/trl/reward_trainer) and more.
+- **Trainers**: Various fine-tuning methods are easily accessible via trainers like [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer), [`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer), [`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer), [`KTOTrainer`](https://huggingface.co/docs/trl/kto_trainer) and more.
 
 - **Efficient and scalable**:
   - Leverages [🤗 Accelerate](https://github.com/huggingface/accelerate) to scale from single GPU to multi-node clusters using methods like [DDP](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html) and [DeepSpeed](https://github.com/deepspeedai/DeepSpeed).
@@ -90,7 +96,7 @@ trainer.train()
 
 ### `GRPOTrainer`
 
-[`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer) implements the [Group Relative Policy Optimization (GRPO) algorithm](https://huggingface.co/papers/2402.03300) that is more memory-efficient than PPO and was used to train [Deepseek AI's R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
+[`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer) implements the [Group Relative Policy Optimization (GRPO) algorithm](https://huggingface.co/papers/2402.03300) that is more memory-efficient than PPO and was used to train [Deepseek AI's R1](https://huggingface.co/deepseek-ai/DeepSeek-R1). `accuracy_reward` needs math-verify, which you can install with `pip install trl[math_verify]`.
 
 ```python
 from datasets import load_dataset
@@ -121,6 +127,23 @@ from trl import DPOTrainer
 dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
 
 trainer = DPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+### `KTOTrainer`
+
+[`KTOTrainer`](https://huggingface.co/docs/trl/kto_trainer) implements the [Kahneman-Tversky Optimization (KTO) algorithm](https://huggingface.co/papers/2402.01306), which aligns models from simple binary (desirable / undesirable) feedback rather than paired preferences. Here is a basic example of how to use the `KTOTrainer`:
+
+```python
+from datasets import load_dataset
+from trl import KTOTrainer
+
+dataset = load_dataset("trl-lib/kto-mix-14k", split="train")
+
+trainer = KTOTrainer(
     model="Qwen/Qwen3-0.6B",
     train_dataset=dataset,
 )
@@ -161,7 +184,15 @@ trl sft --model_name_or_path Qwen/Qwen2.5-0.5B \
 ```bash
 trl dpo --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
     --dataset_name argilla/Capybara-Preferences \
-    --output_dir Qwen2.5-0.5B-DPO 
+    --output_dir Qwen2.5-0.5B-DPO
+```
+
+**KTO:**
+
+```bash
+trl kto --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --dataset_name trl-lib/kto-mix-14k \
+    --output_dir Qwen2.5-0.5B-KTO
 ```
 
 Read more about CLI in the [relevant documentation section](https://huggingface.co/docs/trl/clis) or use `--help` for more details.

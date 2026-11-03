@@ -20,14 +20,16 @@ from transformers import Trainer
 from transformers.integrations import is_mlflow_available, is_trackio_available, is_wandb_available
 
 
-if is_wandb_available():
-    import wandb
-
 if is_mlflow_available():
     import mlflow
 
+
 if is_trackio_available():
     import trackio
+
+
+if is_wandb_available():
+    import wandb
 
 
 class ProfilingContext:
@@ -44,7 +46,7 @@ class ProfilingContext:
             List of integrations to report metrics to (e.g., ["wandb", "mlflow", "trackio"]).
         is_main_process (`bool`, *optional*, defaults to `True`):
             Whether this is the main process in distributed training. Metrics are only logged from the main process.
-        step (`int` or `None`, *optional*):
+        step (`int`, *optional*):
             Training step to associate with the logged metrics.
         metric_prefix (`str`, *optional*, defaults to `"profiling/Time taken"`):
             Prefix for the metric name in logs.

@@ -12,14 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import tempfile
 from dataclasses import dataclass
-from unittest.mock import mock_open, patch
 
 import pytest
 from datasets import DatasetDict, load_dataset
 
-from trl import DatasetMixtureConfig, TrlParser, get_dataset
+from trl import (
+    DatasetMixtureConfig,
+    DistillationConfig,
+    DPOConfig,
+    GRPOConfig,
+    KTOConfig,
+    RewardConfig,
+    RLOOConfig,
+    SFTConfig,
+    TrlParser,
+    get_dataset,
+)
 from trl.scripts.utils import DatasetConfig
 
 from .testing_utils import TrlTestCase
@@ -37,6 +48,40 @@ class InvalidDataclass:
 
 
 class TestTrlParser(TrlTestCase):
+    def write_config(self, content):
+        config_path = os.path.join(self.tmp_dir, "config.yaml")
+        with open(config_path, "w", encoding="utf-8") as config_file:
+            config_file.write(content)
+        return config_path
+
+    @pytest.mark.parametrize(
+        ("config_cls", "field_name", "value", "expected"),
+        [
+            (SFTConfig, "dataset_kwargs", '{"skip_prepare_dataset": true}', {"skip_prepare_dataset": True}),
+            (GRPOConfig, "chat_template_kwargs", '{"enable_thinking": false}', {"enable_thinking": False}),
+            (GRPOConfig, "generation_kwargs", '{"suppress_tokens": [1, 2]}', {"suppress_tokens": [1, 2]}),
+            (RLOOConfig, "chat_template_kwargs", '{"enable_thinking": false}', {"enable_thinking": False}),
+            (DistillationConfig, "generation_kwargs", '{"suppress_tokens": [1]}', {"suppress_tokens": [1]}),
+        ],
+    )
+    def test_dict_field_from_command_line(self, config_cls, field_name, value, expected):
+        """Dict-typed fields are passed as JSON on the command line and decoded into dicts."""
+        parser = TrlParser(dataclass_types=[config_cls])
+        (config,) = parser.parse_args_into_dataclasses(["--output_dir", "dummy", f"--{field_name}", value])
+        assert getattr(config, field_name) == expected
+
+    @pytest.mark.parametrize(
+        "config_cls", [DistillationConfig, DPOConfig, GRPOConfig, KTOConfig, RewardConfig, RLOOConfig, SFTConfig]
+    )
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("128", 128), ("None", None), ("none", None), ("null", None), ("auto", None)]
+    )
+    def test_pad_to_multiple_of_from_command_line(self, config_cls, value, expected):
+        """`pad_to_multiple_of` arrives as a string on the command line; `"auto"` resolves to `None` off Neuron."""
+        parser = TrlParser(dataclass_types=[config_cls])
+        (config,) = parser.parse_args_into_dataclasses(["--output_dir", "dummy", "--pad_to_multiple_of", value])
+        assert config.pad_to_multiple_of == expected
+
     def test_init_without_config_field(self):
         """Test initialization without 'config' field in the dataclasses."""
         parser = TrlParser(dataclass_types=[MyDataclass])
@@ -47,27 +92,22 @@ class TestTrlParser(TrlTestCase):
         with pytest.raises(ValueError, match="has a field named 'config'"):
             TrlParser(dataclass_types=[InvalidDataclass])
 
-    @patch("builtins.open", mock_open(read_data="env:\n VAR1: value1\n VAR2: value2\narg1: 2"))
-    @patch("yaml.safe_load")
-    @patch("os.environ", new_callable=dict)  # Mock os.environ as a dictionary
-    def test_parse_args_and_config_with_valid_config(self, mock_environ, mock_yaml_load):
+    def test_parse_args_and_config_with_valid_config(self, monkeypatch):
         """Test parse_args_and_config method with valid arguments and config."""
-        mock_yaml_load.return_value = {"env": {"VAR1": "value1", "VAR2": "value2"}, "arg1": 2}
+        # Registered with monkeypatch so the variables the config sets are restored after the test
+        monkeypatch.setenv("VAR1", "")
+        monkeypatch.setenv("VAR2", "")
+        config_path = self.write_config("env:\n  VAR1: value1\n  VAR2: value2\narg1: 2")
 
         parser = TrlParser(dataclass_types=[MyDataclass])
 
-        args = ["--arg2", "value", "--config", "config.yaml"]  # don't set arg1 to test default value
+        args = ["--arg2", "value", "--config", config_path]  # don't set arg1 to test default value
 
-        # Simulate the config being loaded and environment variables being set
         result_args = parser.parse_args_and_config(args)
 
-        # Set the environment variables using the mock
-        mock_environ["VAR1"] = "value1"
-        mock_environ["VAR2"] = "value2"
-
-        # Ensure that the environment variables were set correctly
-        assert mock_environ.get("VAR1") == "value1"
-        assert mock_environ.get("VAR2") == "value2"
+        # Ensure that the environment variables were set from the config
+        assert os.environ["VAR1"] == "value1"
+        assert os.environ["VAR2"] == "value2"
 
         # Check the parsed arguments
         assert len(result_args) == 1
@@ -75,15 +115,13 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg1 == 2
         assert result_args[0].arg2 == "value"
 
-    @patch("builtins.open", mock_open(read_data="arg1: 2"))
-    @patch("yaml.safe_load")
-    def test_parse_args_and_arg_override_config(self, mock_yaml_load):
+    def test_parse_args_and_arg_override_config(self):
         """Test parse_args_and_config method and check that arguments override the config."""
-        mock_yaml_load.return_value = {"arg1": 2}  # this arg is meant to be overridden
+        config_path = self.write_config("arg1: 2")
 
         parser = TrlParser(dataclass_types=[MyDataclass])
 
-        args = ["--arg1", "3", "--config", "config.yaml"]  # override arg1 default with 3
+        args = ["--arg1", "3", "--config", config_path]  # override arg1 default with 3
 
         # Simulate the config being loaded and arguments being passed
         result_args = parser.parse_args_and_config(args)
@@ -93,18 +131,24 @@ class TestTrlParser(TrlTestCase):
         assert isinstance(result_args[0], MyDataclass)
         assert result_args[0].arg1 == 3
 
-    @patch("builtins.open", mock_open(read_data="env: not_a_dict"))
-    @patch("yaml.safe_load")
-    def test_parse_args_and_config_with_invalid_env(self, mock_yaml_load):
+    def test_parse_args_and_config_with_invalid_env(self):
         """Test parse_args_and_config method when the 'env' field is not a dictionary."""
-        mock_yaml_load.return_value = {"env": "not_a_dict"}
+        config_path = self.write_config("env: not_a_dict")
 
         parser = TrlParser(dataclass_types=[MyDataclass])
 
-        args = ["--arg1", "2", "--arg2", "value", "--config", "config.yaml"]
+        args = ["--arg1", "2", "--arg2", "value", "--config", config_path]
 
         with pytest.raises(ValueError, match="`env` field should be a dict in the YAML file."):
             parser.parse_args_and_config(args)
+
+    @pytest.mark.parametrize("config", ["", "[]", "value", "42"])
+    def test_parse_args_and_config_with_non_mapping_config(self, config):
+        config_path = self.write_config(config)
+        parser = TrlParser(dataclass_types=[MyDataclass])
+
+        with pytest.raises(ValueError, match="must contain a YAML mapping"):
+            parser.parse_args_and_config(["--config", config_path])
 
     def test_parse_args_and_config_without_config(self):
         """Test parse_args_and_config without the `--config` argument."""
@@ -149,14 +193,12 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg2 == "value"
         assert result_args[1] == ["remaining"]
 
-    @patch("builtins.open", mock_open(read_data="remaining_string_in_config: abc"))
-    @patch("yaml.safe_load")
-    def test_parse_args_and_config_with_remaining_strings_in_config_and_args(self, mock_yaml_load):
-        mock_yaml_load.return_value = {"remaining_string_in_config": "abc"}
+    def test_parse_args_and_config_with_remaining_strings_in_config_and_args(self):
+        config_path = self.write_config("remaining_string_in_config: abc")
 
         parser = TrlParser(dataclass_types=[MyDataclass])
 
-        args = ["--arg1", "2", "--remaining_string_in_args", "def", "--config", "config.yaml"]
+        args = ["--arg1", "2", "--remaining_string_in_args", "def", "--config", config_path]
 
         # Simulate the config being loaded and arguments being passed
         result_args = parser.parse_args_and_config(args, return_remaining_strings=True)
@@ -167,11 +209,9 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg1 == 2
         assert result_args[1] == ["--remaining_string_in_config", "abc", "--remaining_string_in_args", "def"]
 
-    @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
-    @patch("yaml.safe_load")
-    def test_subparsers_with_config_defaults(self, mock_yaml_load):
+    def test_subparsers_with_config_defaults(self):
         """Test that config defaults are applied to all subparsers."""
-        mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
+        config_path = self.write_config("arg1: 2\narg2: config_value")
 
         # Create the main parser
         parser = TrlParser()
@@ -183,7 +223,7 @@ class TestTrlParser(TrlTestCase):
         subparsers.add_parser("subcommand", dataclass_types=[MyDataclass])
 
         # Parse with config file
-        args = ["subcommand", "--config", "config.yaml"]
+        args = ["subcommand", "--config", config_path]
         result_args = parser.parse_args_and_config(args)
 
         # Check main parser arguments
@@ -193,11 +233,9 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg1 == 2  # Default from config
         assert result_args[0].arg2 == "config_value"  # Default from config
 
-    @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
-    @patch("yaml.safe_load")
-    def test_subparsers_with_config_defaults_and_arg_override(self, mock_yaml_load):
+    def test_subparsers_with_config_defaults_and_arg_override(self):
         """Test that config defaults are applied to all subparsers."""
-        mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
+        config_path = self.write_config("arg1: 2\narg2: config_value")
 
         # Create the main parser
         parser = TrlParser()
@@ -209,18 +247,16 @@ class TestTrlParser(TrlTestCase):
         subparsers.add_parser("subcommand", dataclass_types=[MyDataclass])
 
         # Test with command line arguments overriding config
-        args = ["subcommand", "--arg1", "3", "--config", "config.yaml"]
+        args = ["subcommand", "--arg1", "3", "--config", config_path]
         result_args = parser.parse_args_and_config(args)
 
         # Command line arguments should override config
         assert result_args[0].arg1 == 3
         assert result_args[0].arg2 == "config_value"  # Still from config
 
-    @patch("builtins.open", mock_open(read_data="arg1: 2\nthis_arg_does_not_exist: config_value"))
-    @patch("yaml.safe_load")
-    def test_subparsers_with_config_defaults_and_arg_override_wrong_name(self, mock_yaml_load):
+    def test_subparsers_with_config_defaults_and_arg_override_wrong_name(self):
         """Test that config defaults are applied to all subparsers."""
-        mock_yaml_load.return_value = {"arg1": 2, "this_arg_does_not_exist": "config_value"}
+        config_path = self.write_config("arg1: 2\nthis_arg_does_not_exist: config_value")
 
         # Create the main parser
         parser = TrlParser()
@@ -232,17 +268,15 @@ class TestTrlParser(TrlTestCase):
         subparsers.add_parser("subcommand", dataclass_types=[MyDataclass])
 
         # Test with command line arguments overriding config
-        args = ["subcommand", "--arg1", "3", "--config", "config.yaml"]
+        args = ["subcommand", "--arg1", "3", "--config", config_path]
         with pytest.raises(ValueError):
             parser.parse_args_and_config(args)
 
         parser.parse_args_and_config(args, fail_with_unknown_args=False)
 
-    @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
-    @patch("yaml.safe_load")
-    def test_subparsers_multiple_with_config_defaults(self, mock_yaml_load):
+    def test_subparsers_multiple_with_config_defaults(self):
         """Test that config defaults are applied to all subparsers."""
-        mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
+        config_path = self.write_config("arg1: 2\narg2: config_value")
 
         # Create the main parser
         parser = TrlParser()
@@ -256,7 +290,7 @@ class TestTrlParser(TrlTestCase):
 
         for idx in range(2):
             # Parse with config file
-            args = [f"subcommand{idx}", "--config", "config.yaml"]
+            args = [f"subcommand{idx}", "--config", config_path]
             result_args = parser.parse_args_and_config(args)
 
             # Check main parser arguments
@@ -333,6 +367,40 @@ class TestGetDataset:
         )
         assert prompts[len(prompts) // 2 :] == expected_second_half["prompt"]
 
+    def test_dataset_fraction(self):
+        # `fraction` sets each source's target share of the final mixture: normalized to sum to one and capped so no
+        # source is oversampled. With weights 0.75/0.25 on two equally-sized sources, the 0.75 source is the binding
+        # constraint (kept in full) and the 0.25 source contributes a third of its rows.
+        mixture_config = DatasetMixtureConfig(
+            datasets=[
+                DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.75),
+                DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.25),
+            ]
+        )
+        result = get_dataset(mixture_config)
+        full = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
+        n_second = round(len(full) / 3)  # 0.25 * (len(full) / 0.75)
+        expected = list(full) + list(full.select(range(n_second)))
+        assert list(result["train"]) == expected
+
+    def test_dataset_fraction_partial_raises_error(self):
+        mixture_config = DatasetMixtureConfig(
+            datasets=[
+                DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.5),
+                DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling"),
+            ]
+        )
+        with pytest.raises(ValueError, match="must be set for either all datasets"):
+            get_dataset(mixture_config)
+
+    def test_dataset_fraction_streaming_raises_error(self):
+        mixture_config = DatasetMixtureConfig(
+            datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.5)],
+            streaming=True,
+        )
+        with pytest.raises(ValueError, match="not supported with streaming datasets"):
+            get_dataset(mixture_config)
+
     def test_dataset_mixture_with_test_split(self):
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling")],
@@ -378,7 +446,7 @@ class TestGetDataset:
         """
 
         # Write YAML to a temporary file
-        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as tmpfile:
+        with tempfile.NamedTemporaryFile("w+", suffix=".yaml", encoding="utf-8") as tmpfile:
             tmpfile.write(yaml_content)
             tmpfile.flush()
             parser = TrlParser((DatasetMixtureConfig,))
@@ -414,7 +482,7 @@ class TestGetDataset:
         """
 
         # Write YAML to a temporary file
-        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as tmpfile:
+        with tempfile.NamedTemporaryFile("w+", suffix=".yaml", encoding="utf-8") as tmpfile:
             tmpfile.write(yaml_content)
             tmpfile.flush()
             parser = TrlParser((DatasetMixtureConfig,))

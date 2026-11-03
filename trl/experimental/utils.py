@@ -24,12 +24,14 @@ import pyarrow as pa
 import pyarrow.types
 import torch
 from accelerate.utils import is_peft_model
-from packaging.version import Version
 from pyarrow import compute as pc
+from tokenizers.models import BPE
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments
+from transformers.data.data_collator import DataCollatorMixin
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.processing_utils import ProcessorMixin
 from transformers.utils import (
     is_peft_available,
     is_torch_mlu_available,
@@ -38,12 +40,17 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
-from ..data_utils import DatasetType, _get_dataset_format
-from ..trainer.utils import pad
+from ..data_utils import (
+    DatasetType,
+    _get_dataset_format,
+    apply_chat_template,
+    is_conversational,
+    prepare_multimodal_messages,
+)
+from ..trainer.utils import flush_left, pad
 
 
 if is_peft_available():
-    import peft
     from peft import PeftConfig, PeftModel, get_peft_model
 
 
@@ -145,12 +152,25 @@ def is_byte_level_tokenizer(backend) -> bool:
     return "ByteLevel" in repr(backend.pre_tokenizer) or "ByteLevel" in repr(backend.decoder)
 
 
-def piece_byte_len(piece: str) -> int:
-    """UTF-8 byte length of a ByteLevel BPE token piece \u2014 each char maps 1:1 to one source byte.
+def supports_byte_offsets(backend) -> bool:
+    """Whether byte offsets can be derived for ``backend``: ByteLevel BPE, or byte-fallback BPE (Gemma) whose decoder
+    keeps the leading space. ``Strip`` decoders (Llama 2, Mistral v0.1/v0.2) drop it, so the piece bytes of sampled ids
+    would not match the decoded text."""
+    if is_byte_level_tokenizer(backend):
+        return True
+    return isinstance(backend.model, BPE) and backend.model.byte_fallback and "Strip" not in repr(backend.decoder)
 
-    Cross-tokenizer ULD targets ByteLevel BPE pairs (Llama-3, Qwen, SmolLM, Phi, Mistral v0.3+, \u2026); SentencePiece
-    students are out of scope here and would need the loss-level projection from X-Token to align."""
-    return len(piece)
+
+def piece_byte_len(piece: str, byte_level: bool) -> int:
+    """UTF-8 byte length of a token piece.
+
+    ByteLevel pieces map each char 1:1 to one source byte. Byte-fallback pieces are either ``<0xXX>`` (one byte) or
+    UTF-8 text with ``\u2581`` standing for a space."""
+    if byte_level:
+        return len(piece)
+    if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+        return 1
+    return len(piece.replace("\u2581", " ").encode("utf-8"))
 
 
 def _bytes_to_unicode() -> dict[int, str]:
@@ -180,7 +200,9 @@ def _byte_level_piece_len(piece: str, text_bytes: bytes, start: int) -> int | No
     return len(piece_bytes)
 
 
-def _split_repeated_byte_offsets(byte_offsets: list[tuple[int, int]], tokens: list[str]) -> list[tuple[int, int]]:
+def _split_repeated_byte_offsets(
+    byte_offsets: list[tuple[int, int]], tokens: list[str], byte_level: bool
+) -> list[tuple[int, int]]:
     """Split repeated char-derived spans for byte-fallback or byte-level tokens."""
     normalized = list(byte_offsets)
     i = 0
@@ -191,7 +213,7 @@ def _split_repeated_byte_offsets(byte_offsets: list[tuple[int, int]], tokens: li
 
         if j - i > 1:
             start, end = byte_offsets[i]
-            piece_lengths = [piece_byte_len(token) for token in tokens[i:j]]
+            piece_lengths = [piece_byte_len(token, byte_level) for token in tokens[i:j]]
             if sum(piece_lengths) == end - start:
                 cursor = start
                 for offset_idx, length in enumerate(piece_lengths, start=i):
@@ -203,9 +225,9 @@ def _split_repeated_byte_offsets(byte_offsets: list[tuple[int, int]], tokens: li
 
 
 def _normalize_byte_offsets(
-    byte_offsets: list[tuple[int, int]], tokens: list[str], text_bytes: bytes
+    byte_offsets: list[tuple[int, int]], tokens: list[str], text_bytes: bytes, byte_level: bool
 ) -> list[tuple[int, int]]:
-    byte_offsets = _split_repeated_byte_offsets(byte_offsets, tokens)
+    byte_offsets = _split_repeated_byte_offsets(byte_offsets, tokens, byte_level)
     normalized = []
     cursor = 0
 
@@ -214,7 +236,7 @@ def _normalize_byte_offsets(
             normalized.append((cursor, cursor))
             continue
 
-        piece_len = _byte_level_piece_len(tokens[idx], text_bytes, start)
+        piece_len = _byte_level_piece_len(tokens[idx], text_bytes, start) if byte_level else None
         next_start = byte_offsets[idx + 1][0] if idx + 1 < len(byte_offsets) else None
         has_overlap = start < cursor or (next_start is not None and next_start < end)
 
@@ -242,20 +264,24 @@ def encode_with_byte_offsets(backend, texts: list[str], add_special_tokens: bool
 
     Byte offsets are derived from the fast tokenizer's character offsets via an O(N) char-to-byte cumulative table.
     Overlapping spans from byte-level and byte-fallback tokens are split across their byte pieces."""
-    if not is_byte_level_tokenizer(backend):
+    if not supports_byte_offsets(backend):
         raise NotImplementedError(
-            "Cross-tokenizer ULD currently supports only ByteLevel BPE tokenizers "
-            "(Llama-3, Qwen, SmolLM, Phi, Mistral v0.3+, …). The given tokenizer is not ByteLevel."
+            "Cross-tokenizer ULD currently supports only ByteLevel BPE tokenizers (Llama-3, Qwen, SmolLM, Phi, "
+            "Mistral v0.3+, …) and byte-fallback BPE tokenizers without a `Strip` decoder (Gemma)."
         )
+    byte_level = is_byte_level_tokenizer(backend)
     encs = backend.encode_batch(texts, add_special_tokens=add_special_tokens)
     out = []
     for text, enc in zip(texts, encs, strict=True):
+        # Some tokenizer.json files enable batch padding (e.g. Gemma), so drop the pad positions.
+        keep = [idx for idx, mask in enumerate(enc.attention_mask) if mask]
+        tokens = [enc.tokens[idx] for idx in keep]
         char_to_byte = [0]
         for ch in text:
             char_to_byte.append(char_to_byte[-1] + len(ch.encode("utf-8")))
-        byte_offsets = [(char_to_byte[s], char_to_byte[e]) for s, e in enc.offsets]
-        byte_offsets = _normalize_byte_offsets(byte_offsets, enc.tokens, text.encode("utf-8"))
-        out.append((list(enc.ids), byte_offsets))
+        byte_offsets = [(char_to_byte[enc.offsets[idx][0]], char_to_byte[enc.offsets[idx][1]]) for idx in keep]
+        byte_offsets = _normalize_byte_offsets(byte_offsets, tokens, text.encode("utf-8"), byte_level)
+        out.append(([enc.ids[idx] for idx in keep], byte_offsets))
     return out
 
 
@@ -299,7 +325,7 @@ class DataCollatorForChatML:
                 formatted_message = self.tokenizer.apply_chat_template(
                     message, add_generation_prompt=False, tokenize=False
                 )
-                if is_byte_level_tokenizer(self.tokenizer.backend_tokenizer):
+                if supports_byte_offsets(self.tokenizer.backend_tokenizer):
                     [(message_input_ids_full, full_offs)] = encode_with_byte_offsets(
                         self.tokenizer.backend_tokenizer, [formatted_message], add_special_tokens=False
                     )
@@ -309,9 +335,9 @@ class DataCollatorForChatML:
                         len(message_input_ids_full),
                     )
                 else:
-                    # Non-ByteLevel tokenizer: byte offsets are unnecessary (cross-tokenizer ULD requires ByteLevel
-                    # anyway). Fall back to plain tokenization so GKD / non-ULD trainers with SentencePiece or
-                    # Unigram tokenizers still work through this collator.
+                    # No byte offsets for this tokenizer (cross-tokenizer ULD can't use it anyway). Fall back to plain
+                    # tokenization so GKD / non-ULD trainers with Strip-decoder SentencePiece or Unigram tokenizers
+                    # still work through this collator.
                     message_input_ids_full = self.tokenizer(
                         formatted_message, add_special_tokens=False, return_tensors=None
                     )["input_ids"]
@@ -369,6 +395,13 @@ class DataCollatorForChatML:
                     current_prompt_ids = tokenized_prompt["input_ids"][: len(sample_ids)]
                 byte_offsets.append(example.get("byte_offsets", [(0, 0)] * len(sample_ids)))
 
+            if len(current_prompt_ids) == 0:
+                raise ValueError(
+                    f"An example has no prompt tokens left after truncation to max_length={self.max_length}. This "
+                    "happens when the completion alone fills the whole window, so the prompt is entirely dropped, "
+                    "leaving nothing to generate from. Increase `max_length`."
+                )
+
             prompts_input_ids.append(current_prompt_ids)
             prompt_attention_mask.append([1] * len(current_prompt_ids))
 
@@ -416,17 +449,245 @@ class DataCollatorForChatML:
         return out
 
 
+@dataclass
+class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
+    """
+    Data collator for GOLD VLM training.
+
+    Combines image processing from [`~trainer.sft_trainer.DataCollatorForVisionLanguageModeling`] with the
+    prompt-separation logic that GOLD needs for on-policy generation. Each input example should be a dictionary
+    containing at least:
+    - An `"images"` key holding a list of images, or an `"image"` key holding a single image.
+    - Keys `"prompt"` and `"completion"` for the prompt and completion (conversational or plain text).
+
+    The collator outputs a dictionary including:
+    - `"input_ids"`: Tensor of token IDs (prompt + completion, concatenated).
+    - `"attention_mask"`: Tensor indicating attention mask.
+    - `"labels"`: Tensor for training labels (prompt tokens masked with -100).
+    - `"prompts"`: Tensor of prompt-only token IDs (left-padded), used for on-policy generation.
+    - `"prompt_attention_mask"`: Attention mask for prompts.
+    - `"original_prompt_text"`: List of raw prompt text strings, used for ULD cross-tokenizer distillation.
+    - `"original_completion_text"`: List of raw completion text strings, used for ULD cross-tokenizer distillation.
+    - `"pixel_values"`: Tensor representing image pixel values.
+
+    Additional keys may be present depending on the processor, such as `"image_grid_thw"` or `"image_position_ids"`.
+
+    Args:
+        processor ([`~transformers.ProcessorMixin`]):
+            The processor used to tokenize text and process images.
+        max_length (`int` or `None`, *optional*):
+            Maximum sequence length for input tokens. If `None`, no truncation is applied.
+        return_tensors (`str`, *optional*, defaults to `"pt"`):
+            The tensor type to return.
+    """
+
+    processor: ProcessorMixin
+    max_length: int | None = None
+    return_tensors: str = "pt"
+
+    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        if "prompt" not in examples[0] or "completion" not in examples[0]:
+            raise KeyError(
+                "DataCollatorForVisionLanguageChatML requires 'prompt' and 'completion' keys in examples. "
+                f"Got keys: {list(examples[0].keys())}."
+            )
+
+        # Normalize single image to list
+        if "image" in examples[0]:
+            for example in examples:
+                image = example.get("image")
+                example["images"] = [image] if image is not None else []
+        images = [example.get("images", []) for example in examples]
+        if all(img_list == [] for img_list in images):
+            images = None
+
+        # Capture raw prompt/completion text before `apply_chat_template` mutates the examples.
+        def _raw_text_from_messages(messages_or_str: Any) -> str:
+            if isinstance(messages_or_str, str):
+                return messages_or_str
+            parts: list[str] = []
+            for turn in messages_or_str:
+                content = turn.get("content", "")
+                if isinstance(content, str):
+                    if content:
+                        parts.append(content)
+                    continue
+                turn_parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text:
+                            turn_parts.append(text)
+                    elif isinstance(block, str):
+                        turn_parts.append(block)
+                if turn_parts:
+                    parts.append("\n".join(turn_parts))
+            return "\n".join(parts)
+
+        raw_prompt_texts = [_raw_text_from_messages(example["prompt"]) for example in examples]
+        raw_completion_texts = [_raw_text_from_messages(example["completion"]) for example in examples]
+
+        # Apply chat template for conversational data
+        if is_conversational(examples[0]):
+            for example in examples:
+                example["prompt"] = prepare_multimodal_messages(example["prompt"], images=example["images"])
+                example["completion"] = prepare_multimodal_messages(example["completion"])
+            examples = [apply_chat_template(example, self.processor) for example in examples]
+
+        prompts = [example["prompt"] for example in examples]
+        completions = [example["completion"] for example in examples]
+
+        # Process prompts (with images) and completions (text only) separately
+        processed_prompts = self.processor(
+            images=images,
+            text=prompts,
+            padding=True,
+            padding_side="left",
+            return_tensors=self.return_tensors,
+            add_special_tokens=False,
+        )
+        processed_completions = self.processor(
+            text=completions,
+            padding=True,
+            padding_side="right",
+            return_tensors=self.return_tensors,
+            add_special_tokens=False,
+        )
+
+        # Concatenate prompts and completions
+        prompt_ids, prompt_mask = (
+            processed_prompts["input_ids"],
+            processed_prompts["attention_mask"],
+        )
+        completion_ids, completion_mask = (
+            processed_completions["input_ids"],
+            processed_completions["attention_mask"],
+        )
+        input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
+        attention_mask = torch.cat((prompt_mask, completion_mask), dim=1)
+        completion_mask = torch.cat((torch.zeros_like(prompt_mask), completion_mask), dim=1)
+        if "token_type_ids" in processed_prompts:
+            prompt_token_type_ids = processed_prompts["token_type_ids"]
+            completion_token_type_ids = processed_completions.get("token_type_ids", torch.zeros_like(completion_ids))
+            token_type_ids = torch.cat((prompt_token_type_ids, completion_token_type_ids), dim=1)
+        if "mm_token_type_ids" in processed_prompts:
+            prompt_mm_token_type_ids = processed_prompts["mm_token_type_ids"]
+            completion_mm_token_type_ids = processed_completions.get(
+                "mm_token_type_ids", torch.zeros_like(completion_ids)
+            )
+            mm_token_type_ids = torch.cat((prompt_mm_token_type_ids, completion_mm_token_type_ids), dim=1)
+
+        # Flush left to reduce padding
+        if "token_type_ids" in processed_prompts and "mm_token_type_ids" in processed_prompts:
+            (
+                attention_mask,
+                input_ids,
+                completion_mask,
+                token_type_ids,
+                mm_token_type_ids,
+            ) = flush_left(
+                attention_mask,
+                input_ids,
+                completion_mask,
+                token_type_ids,
+                mm_token_type_ids,
+            )
+        elif "token_type_ids" in processed_prompts:
+            attention_mask, input_ids, completion_mask, token_type_ids = flush_left(
+                attention_mask, input_ids, completion_mask, token_type_ids
+            )
+        elif "mm_token_type_ids" in processed_prompts:
+            attention_mask, input_ids, completion_mask, mm_token_type_ids = flush_left(
+                attention_mask, input_ids, completion_mask, mm_token_type_ids
+            )
+        else:
+            attention_mask, input_ids, completion_mask = flush_left(attention_mask, input_ids, completion_mask)
+
+        # Truncate if necessary
+        if self.max_length is not None:
+            input_ids = input_ids[:, : self.max_length]
+            attention_mask = attention_mask[:, : self.max_length]
+            completion_mask = completion_mask[:, : self.max_length]
+            if "token_type_ids" in processed_prompts:
+                token_type_ids = token_type_ids[:, : self.max_length]
+            if "mm_token_type_ids" in processed_prompts:
+                mm_token_type_ids = mm_token_type_ids[:, : self.max_length]
+            # Truncate the prompt tensors used for on-policy generation. Keep the start
+            # (matching SFT/DPO VLM truncation) so image placeholder tokens at the beginning
+            # of the prompt are preserved. Left padding is retained but harmless — the
+            # attention mask masks it out during generation.
+            prompt_ids = prompt_ids[:, : self.max_length]
+            prompt_mask = prompt_mask[:, : self.max_length]
+
+        # Create labels: mask padding and prompt tokens
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        labels[completion_mask == 0] = -100
+
+        # Completion-relative byte offsets for cross-tokenizer ULD. Computed from the final input_ids/labels
+        # via per-token piece byte length (the same primitive the on-policy / teacher path uses), so it is
+        # layout-agnostic after flush_left/truncation and shares the teacher's byte coordinate system.
+        tokenizer = self.processor.tokenizer
+        # Slow tokenizers have no backend; their offsets are unused since extended ULD needs a fast tokenizer
+        byte_level = not tokenizer.is_fast or is_byte_level_tokenizer(tokenizer.backend_tokenizer)
+        piece_len_cache: dict[int, int] = {}
+        byte_offset_rows: list[list[tuple[int, int]]] = []
+        for row_ids, row_labels in zip(input_ids.tolist(), labels.tolist(), strict=True):
+            offs: list[tuple[int, int]] = [(0, 0)] * len(row_ids)
+            cumulative = 0
+            for pos, (tid, label) in enumerate(zip(row_ids, row_labels, strict=True)):
+                if label == -100:
+                    continue
+                if tid not in piece_len_cache:
+                    piece_len_cache[tid] = piece_byte_len(tokenizer.convert_ids_to_tokens([tid])[0], byte_level)
+                nb = piece_len_cache[tid]
+                offs[pos] = (cumulative, cumulative + nb)
+                cumulative += nb
+            byte_offset_rows.append(offs)
+        byte_offsets = torch.tensor(byte_offset_rows, dtype=torch.long)
+
+        # Build output with non-sequence vision keys from processed_prompts (pixel_values, image_grid_thw, etc.).
+        output = {
+            k: v
+            for k, v in processed_prompts.items()
+            if k not in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
+        }
+        output["input_ids"] = input_ids
+        output["attention_mask"] = attention_mask
+        output["labels"] = labels
+        output["byte_offsets"] = byte_offsets
+        if "token_type_ids" in processed_prompts:
+            output["token_type_ids"] = token_type_ids
+        if (
+            "mm_token_type_ids" in processed_prompts
+        ):  # special case for ERNIE-VL from class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
+            output["mm_token_type_ids"] = mm_token_type_ids
+
+        # GOLD-specific: separate prompt tensors for on-policy generation
+        output["prompts"] = prompt_ids
+        output["prompt_attention_mask"] = prompt_mask
+
+        # GOLD-specific: raw text for ULD cross-tokenizer distillation.
+        # These must be the untemplated text (no student chat-template markers) so the
+        # teacher can re-render the prompt through its own chat template and tokenize the
+        # completion cleanly.
+        output["original_prompt_text"] = raw_prompt_texts
+        output["original_completion_text"] = raw_completion_texts
+
+        return output
+
+
 def truncate_right(
-    input_ids: torch.Tensor, stop_token_id: int, pad_token_id: int
+    input_ids: torch.Tensor, stop_token_ids: list[int], pad_token_id: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Truncates the input tensor from the right side after the first occurrence of the stop token.
+    Truncates the input tensor from the right side after the first occurrence of a stop token.
 
     Args:
         input_ids (`torch.Tensor`):
             The tensor containing the responses to be truncated
-        stop_token_id (`int`):
-            The token ID representing the stop token where truncation occurs
+        stop_token_ids (`list[int]`):
+            The token IDs representing the stop tokens where truncation occurs
         pad_token_id (`int`):
             The token ID representing the pad token used to fill the truncated responses
 
@@ -437,7 +698,9 @@ def truncate_right(
             - `mask` (`torch.Tensor`):
                 The mask tensor to indicate the padding tokens
     """
-    trunc_idxs = first_true_indices(input_ids == stop_token_id).unsqueeze(-1)
+    trunc_idxs = first_true_indices(
+        torch.isin(input_ids, torch.tensor(stop_token_ids, device=input_ids.device))
+    ).unsqueeze(-1)
     new_size = [1] * (len(input_ids.size()) - 1) + [input_ids.shape[1]]
     idxs = torch.arange(input_ids.shape[1], device=input_ids.device).view(*new_size)
     output_ids = torch.masked_fill(input_ids, idxs > trunc_idxs, pad_token_id)
@@ -536,10 +799,10 @@ def get_reward(
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
-        output_hidden_states=True,
+        output_hidden_states=False,
         use_cache=False,  # otherwise mistral-based RM would error out
     )
-    reward_logits = model.score(output.hidden_states[-1])
+    reward_logits = model.score(output.last_hidden_state)
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
@@ -657,18 +920,16 @@ def prepare_peft_model(
 
     # Create PEFT model
     if peft_config is not None:
-        if (
-            Version(peft.__version__) >= Version("0.12")  # autocast_adapter_dtype introduced in 0.12
-            and getattr(model, "is_loaded_in_4bit", False)
-            and is_sharded_qlora
-        ):
+        if getattr(model, "is_loaded_in_4bit", False) and is_sharded_qlora:
             model = get_peft_model(model, peft_config, autocast_adapter_dtype=False)
         else:
             model = get_peft_model(model, peft_config)
 
-    # Handle bf16 casting for 4-bit models
+    # Cast remaining fp32 params (LoRA adapters, norms) to bf16 for a uniform dtype, as FSDP requires.
     if args.bf16 and getattr(model, "is_loaded_in_4bit", False) and not is_sharded_qlora:
-        peft_module_casting_to_bf16(model)
+        for param in model.parameters():
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
 
     return model
 
