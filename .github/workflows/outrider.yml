@@ -60,6 +60,11 @@ jobs:
       # x-api-key path; ANTHROPIC_MODEL is optional and only set
       # when the workflow_dispatch input is non-empty).
     steps:
+      - name: Refresh apt lists + pre-install poppler-utils
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils || true
       # Per-dispatch provider + model routing. Default cron runs hit
       # Anthropic (inputs.provider defaults to 'anthropic'); dispatch
       # with `provider=zai` to route one run at z.ai's endpoint.
