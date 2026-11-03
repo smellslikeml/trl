@@ -751,6 +751,23 @@ training_args = AsyncGRPOConfig(
 )
 ```
 
+### EPIC: Rethinking Trust Regions for Autoregressive LLM Policies via Exact-KL Prefix Importance-Ratio Clipping
+
+**📜 Paper**: https://huggingface.co/papers/2610.29999
+
+EPIC clips the importance ratio at the *prefix* level: at every position  \\( t \\)  it tracks the cumulative prefix ratio  \\( r_{\text{pre}} = \prod_{j \leq t} \frac{\pi_\theta(o_j)}{\mu(o_j)} \\)  through its geometric weight  \\( g = r_{\text{pre}}^{1/t} \\), and clips it into position-dependent bounds  \\( [\ell^{1/t}, u^{1/t}] \\)  derived from the exact reverse-KL coordinate  \\( \varphi(r) = r - 1 - \log r \\). The raw bounds solve  \\( \varphi(\ell) = t\,\delta^{-}/\bar{p} \\)  and  \\( \varphi(u) = t\,\delta^{+}/\bar{p} \\), where  \\( \bar{p} \\)  is the geometric mean of the behavior policy probabilities over the prefix, so the trust region adapts both to the prefix length and to how unlikely the sampled prefix was. Clipping is sign-aware (for negative advantages the weight is clamped into the full interval instead of only being capped), and the gradient flows only through the current token's log-probability, leaving the prefix history detached. To reproduce the paper's setting, use this configuration:
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    importance_sampling_level="prefix",
+    loss_type="grpo",  # per-response-length token averaging, as in the paper
+    prefix_kl_delta=5e-4,  # lower trust-region budget δ⁻ recommended by the paper
+    prefix_kl_delta_high=2e-3,  # upper trust-region budget δ⁺ recommended by the paper
+)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
