@@ -76,10 +76,6 @@ class AsyncGRPOConfig(_BaseConfig):
             Minimum token probability, which will be scaled by the probability of the most likely token. It must be a
             value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range. Above `0.0`, `top_k` must be set too,
             with the server flags described under `top_p`.
-        repetition_penalty (`float`, *optional*, defaults to `1.0`):
-            Float that penalizes new tokens based on whether they appear in the prompt and the generated text so far.
-            Values > 1.0 encourage the model to use new tokens, while values < 1.0 encourage the model to repeat
-            tokens.
         chat_template_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         max_tool_calling_iterations (`int`, *optional*):
@@ -120,15 +116,13 @@ class AsyncGRPOConfig(_BaseConfig):
             centering. More cover more of the sampler's probability mass but cost more to serialize; the server's
             `--max-logprobs` bounds it.
         token_budget (`int`, *optional*):
-            Maximum number of tokens forwarded in a single row (one DP rank's forward) for dynamic token-budgeted
-            micro-batching. When `> 0`, a `TokenBudgetBatcher` forms attention-cost-balanced micro-batches whose rows
-            each stay within this budget, bounding peak memory independently of the sample count (the number of samples
-            per row becomes dynamic). The budget bounds unique tokens rather than raw ones, so tokens shared by several
-            samples count once, and it bounds the row's loss terms too. If `None` (default), it is set to the vLLM
-            server's `max_model_len` (queried at train start) — the cap on prompt + completion length — so no rollout
-            sample can ever exceed the budget. A sample longer than `token_budget` fits in no row and is dropped with a
-            warning. Set `<= 0` to disable token budgeting and instead pack a fixed `per_device_train_batch_size ×
-            num_processes` samples per micro-batch, balanced across the rows.
+            Maximum number of tokens forwarded in a single row (one DP rank's forward). A `TokenBudgetBatcher` forms
+            attention-cost-balanced micro-batches whose rows each stay within this budget, bounding peak memory
+            independently of the sample count (the number of samples per row becomes dynamic). The budget bounds unique
+            tokens rather than raw ones, so tokens shared by several samples count once, and it bounds the row's loss
+            terms too. If `None` (default), it is set to the vLLM server's `max_model_len` (queried at train start) —
+            the cap on prompt + completion length — so no rollout sample can ever exceed the budget. A sample longer
+            than `token_budget` fits in no row and is dropped with a warning.
 
         > Parameters that control the async rollout pipeline
 
@@ -280,14 +274,6 @@ class AsyncGRPOConfig(_BaseConfig):
             "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range."
         },
     )
-    repetition_penalty: float = field(
-        default=1.0,
-        metadata={
-            "help": "Float that penalizes new tokens based on whether they appear in the prompt and the generated "
-            "text so far. Values > 1.0 encourage the model to use new tokens, while values < 1.0 encourage the model "
-            "to repeat tokens."
-        },
-    )
     chat_template_kwargs: dict | str | None = field(
         default=None,
         metadata={
@@ -359,14 +345,11 @@ class AsyncGRPOConfig(_BaseConfig):
     token_budget: int | None = field(
         default=None,
         metadata={
-            "help": "Maximum number of tokens forwarded in a single row (one DP rank's forward) for dynamic "
-            "token-budgeted micro-batching. When > 0, a `TokenBudgetBatcher` forms attention-cost-balanced "
-            "micro-batches whose rows each stay within this budget, bounding peak memory independently of the sample "
-            "count. If None (default), it is set to the vLLM server's `max_model_len` (queried at train start), so no "
-            "rollout sample can ever exceed the budget. A sample longer than `token_budget` fits in no row and is "
-            "dropped with a warning. Set <= 0 to disable token budgeting and instead pack a fixed "
-            "`per_device_train_batch_size × num_processes` samples per micro-batch, attention-cost-balanced across "
-            "the rows."
+            "help": "Maximum number of tokens forwarded in a single row (one DP rank's forward). A "
+            "`TokenBudgetBatcher` forms attention-cost-balanced micro-batches whose rows each stay within this "
+            "budget, bounding peak memory independently of the sample count. If None (default), it is set to the "
+            "vLLM server's `max_model_len` (queried at train start), so no rollout sample can ever exceed the budget. "
+            "A sample longer than `token_budget` fits in no row and is dropped with a warning."
         },
     )
 
