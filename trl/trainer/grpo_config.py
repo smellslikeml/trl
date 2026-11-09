@@ -205,6 +205,15 @@ class GRPOConfig(_BaseConfig):
             lambda parameter for negative advantages, it is the exponential decay factor in the VESPO loss. Controls
             how aggressively we down-weight samples with high importance weights (when the importance sampling ratio >
             1).
+        scarl_weighting (`bool`, *optional*, defaults to `False`):
+            Whether to rescale each completion's advantage by its group-relative confidence-alignment gap before the
+            loss, as introduced in the [SCARL paper](https://huggingface.co/papers/2610.40407). The weights are
+            strictly positive (they never flip an advantage's sign), preserve the mean weight of each advantage sign
+            class, and reduce to `1` when all sequence confidences in a group are equal. Requires
+            `num_generations >= 2`, as the weights are computed within groups of completions.
+        scarl_tau (`float`, *optional*, defaults to `5.0`):
+            Temperature of the group-relative softmax over sequence confidences used by SCARL weighting. This
+            parameter is introduced in the [SCARL paper](https://huggingface.co/papers/2610.40407).
         importance_sampling_level (`str`, *optional*, defaults to `"token"`):
             Controls whether importance sampling ratios are computed at the `"token"` or `"sequence"` level. `"token"`
             keeps the raw per-token log-probability ratios (one weight per token). `"sequence"` averages the
@@ -758,6 +767,23 @@ class GRPOConfig(_BaseConfig):
             "help": "lambda parameter for negative advantages, it is the exponential decay factor in the VESPO loss. "
             "Controls how aggressively we down-weight samples with high importance weights (when the importance "
             "sampling ratio > 1)."
+        },
+    )
+    scarl_weighting: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to rescale each completion's advantage by its group-relative confidence-alignment gap "
+            "before the loss, as introduced in the [SCARL paper](https://huggingface.co/papers/2610.40407). The "
+            "weights are strictly positive (they never flip an advantage's sign), preserve the mean weight of each "
+            "advantage sign class, and reduce to `1` when all sequence confidences in a group are equal. Requires "
+            "`num_generations >= 2`, as the weights are computed within groups of completions."
+        },
+    )
+    scarl_tau: float = field(
+        default=5.0,
+        metadata={
+            "help": "Temperature of the group-relative softmax over sequence confidences used by SCARL weighting. "
+            "This parameter is introduced in the [SCARL paper](https://huggingface.co/papers/2610.40407)."
         },
     )
     importance_sampling_level: str = field(

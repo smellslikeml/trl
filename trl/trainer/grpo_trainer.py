@@ -880,6 +880,8 @@ class GRPOTrainer(_BaseTrainer):
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
         self.off_policy_mask_threshold = args.off_policy_mask_threshold
+        self.scarl_weighting = args.scarl_weighting
+        self.scarl_tau = args.scarl_tau
         if is_peft_model(model) and isinstance(model.get_output_embeddings(), BaseTunerLayer):
             # The log-probabilities are computed by multiplying the hidden states by `lm_head.weight` directly, so an
             # adapter on the LM head would be ignored and never trained.
@@ -970,6 +972,12 @@ class GRPOTrainer(_BaseTrainer):
             logger.warning(
                 "VESPO computes sequence-level importance weights internally. `importance_sampling_level` should be "
                 "set to `'token'` (the default)."
+            )
+
+        if args.scarl_weighting and args.num_generations < 2:
+            logger.warning(
+                "SCARL weighting compares the sequence confidences within each group of completions, so it requires "
+                "`num_generations >= 2` to have an effect."
             )
 
         if args.importance_sampling_level == "sequence" and args.loss_type in ["bnpo", "dr_grpo", "dapo", "cispo"]:
@@ -3149,6 +3157,42 @@ class GRPOTrainer(_BaseTrainer):
 
         return phi_seq  # (B, 1)
 
+    @staticmethod
+    @torch.no_grad()
+    def _scarl_reshape(
+        advantages: torch.Tensor,  # (B, 1)
+        old_per_token_logps: torch.Tensor,  # (B, T)
+        mask: torch.Tensor,  # (B, T)
+        num_generations: int,
+        tau: float = 5.0,
+    ) -> torch.Tensor:
+        """
+        Computes the SCARL advantage weights. For reference, within each group of `num_generations` completions:
+            c_i = Σ_t (old_per_token_logps × mask)  (sequence confidence, reuses the old-policy log-likelihood
+                  already computed for the importance ratio, so no extra forward pass)
+            p = softmax(c / (std(c) × tau))  (group-relative softmax with adaptive temperature)
+            raw_i = |1{A_i ≥ 0} − p_i|  (confidence-alignment gap)
+            w_i = raw_i / mean_over_its_class(raw)  (class-wise normalization, E[w | class] = 1)
+        note: the weights are detached via @torch.no_grad(), are strictly positive (they never flip an advantage's
+        sign), and reduce to 1 when all confidences in a group are equal.
+        """
+        # Sequence confidence: masked sum of the old-policy log-probabilities, reshaped as (num_groups, G)
+        c = (old_per_token_logps * mask).sum(-1)
+        c_groups = c.view(-1, num_generations)
+        adv_groups = advantages.squeeze(1).view(-1, num_generations)
+        # Group-relative softmax over confidences, with the temperature scaled by the group's confidence std
+        p = torch.softmax(c_groups / (c_groups.std(dim=1, keepdim=True).clamp(min=1e-8) * tau), dim=1)
+        # Confidence-alignment gap: 1 - p for positive advantages (up-weight low-confidence successes), p for
+        # negative ones (up-weight high-confidence failures)
+        pos = adv_groups >= 0
+        neg = ~pos
+        raw = torch.where(pos, 1.0 - p, p)
+        # Class-wise normalization: keep each sign class's mean weight at 1 to preserve its gradient budget
+        pos_mean = (raw * pos).sum(1, keepdim=True) / pos.sum(1, keepdim=True).clamp(min=1)
+        neg_mean = (raw * neg).sum(1, keepdim=True) / neg.sum(1, keepdim=True).clamp(min=1)
+        scale = torch.where(pos, 1.0 / pos_mean.clamp(min=1e-8), 1.0 / neg_mean.clamp(min=1e-8))
+        return (raw * scale).reshape(-1, 1)  # (B, 1)
+
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -3197,6 +3241,14 @@ class GRPOTrainer(_BaseTrainer):
         # for importance sampling
         old_per_token_logps = inputs.get("old_per_token_logps")
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+
+        # Reshape the advantages with SCARL before the loss dispatch, so that every loss type is covered. The weights
+        # are detached, strictly positive (they never flip an advantage's sign), and reduce to 1 when all confidences
+        # in a group are equal.
+        if self.scarl_weighting:
+            num_generations = self.num_generations if self.model.training else self.num_generations_eval
+            scarl_weights = self._scarl_reshape(advantages, old_per_token_logps, mask, num_generations, self.scarl_tau)
+            advantages = advantages * scarl_weights
 
         if self.off_policy_mask_threshold is not None:
             # OPSM should use inference-time logprobs to detect both sources of off-policyness:

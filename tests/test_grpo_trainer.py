@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -147,6 +148,51 @@ class TestGetHighEntropyMask(TrlTestCase):
         entropy_mask = self.get_high_entropy_mask(entropies, mask, threshold=0.5)
         expected_mask = torch.tensor([[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.bool)
         torch.testing.assert_close(entropy_mask, expected_mask)
+
+
+class TestScarlReshape(TrlTestCase):
+    def test_reduces_to_base_when_confidences_match(self):
+        # When all sequence confidences within a group are equal, the softmax is uniform, the alignment gap is
+        # constant within each sign class, and the class-wise normalization turns it into a weight of 1: SCARL
+        # reduces to the base objective and leaves the advantages unchanged.
+        old_per_token_logps = torch.tensor(
+            [
+                [-1.0, -2.0, -3.0, -4.0],  # sums to -10
+                [-4.0, -3.0, -2.0, -1.0],  # sums to -10
+                [-2.5, -2.5, -2.5, -2.5],  # sums to -10
+                [-0.5, -0.5, -1.0, -1.0],  # sums to -3
+                [-1.0, -1.0, -0.5, -0.5],  # sums to -3
+                [-0.75, -0.75, -0.75, -0.75],  # sums to -3
+            ]
+        )
+        mask = torch.ones(6, 4)
+        advantages = torch.tensor([[1.0], [-0.5], [0.5], [-1.0], [2.0], [-2.0]])
+
+        weights = GRPOTrainer._scarl_reshape(advantages, old_per_token_logps, mask, num_generations=3, tau=5.0)
+
+        torch.testing.assert_close(weights, torch.ones_like(advantages))
+        torch.testing.assert_close(advantages * weights, advantages)
+
+    def test_preserves_class_gradient_budget(self):
+        # With distinct confidences the weights differ from 1, stay strictly positive (they never flip an
+        # advantage's sign), and average to 1 within each advantage sign class (the class-wise normalization).
+        old_per_token_logps = torch.tensor(
+            [
+                [-2.5, -2.5, -2.5, -2.5],  # sums to -10
+                [-0.5, -0.5, -0.5, -0.5],  # sums to -2
+                [-1.5, -1.5, -1.5, -1.5],  # sums to -6
+                [-0.75, -0.75, -0.75, -0.75],  # sums to -3
+            ]
+        )
+        mask = torch.ones(4, 4)
+        advantages = torch.tensor([[1.0], [0.5], [-0.5], [-2.0]])
+
+        weights = GRPOTrainer._scarl_reshape(advantages, old_per_token_logps, mask, num_generations=4, tau=5.0)
+
+        assert (weights > 0).all()
+        assert not torch.allclose(weights, torch.ones_like(weights))
+        torch.testing.assert_close(weights[0:2].mean(), torch.tensor(1.0))
+        torch.testing.assert_close(weights[2:4].mean(), torch.tensor(1.0))
 
 
 class TestGRPORolloutDispatch(TrlTestCase):
@@ -398,6 +444,39 @@ class TestGRPOTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_train_scarl_weighting(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # one intact group per batch, as SCARL weighting operates within groups
+            max_completion_length=32,  # reduce the completion length to reduce memory usage
+            gradient_accumulation_steps=2,  # set to 2 to test that SCARL can operate with accumulated batch
+            scarl_weighting=True,
+            scarl_tau=5.0,
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert math.isfinite(trainer.state.log_history[-1]["train_loss"])
 
         # Check that the params have changed
         for n, param in previous_trainable_params.items():

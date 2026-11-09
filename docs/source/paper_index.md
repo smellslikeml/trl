@@ -751,6 +751,21 @@ training_args = AsyncGRPOConfig(
 )
 ```
 
+### SCARL: Sequence Confidence-Aligned Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2610.40407
+
+SCARL rescales each completion's advantage by its group-relative confidence-alignment gap before the loss. The sequence confidence is the old-policy log-likelihood of the completion, which is already computed for the importance ratio, so SCARL adds no extra forward pass. Within each group of `num_generations` completions, a softmax with adaptive temperature `std(c) · tau` turns the confidences into probabilities `p`; the alignment gap `|1{A ≥ 0} − p|` up-weights low-confidence successes and high-confidence failures, and is then class-wise normalized so each advantage sign class keeps its mean weight (and therefore its gradient budget). The weights are strictly positive (they never flip an advantage's sign) and reduce to `1` when all confidences in a group are equal. SCARL is orthogonal to the loss formulation and composes with any `loss_type`:
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    scarl_weighting=True,
+    scarl_tau=5.0,  # temperature of the confidence softmax (paper default)
+)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
